@@ -1,0 +1,318 @@
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+
+macro_rules! choice {
+    ($name:ident { $($variant:ident),+ $(,)? }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+        #[serde(rename_all = "snake_case")]
+        pub enum $name { $($variant),+ }
+    };
+}
+choice!(IssueKind {
+    Epic,
+    Story,
+    Task,
+    Bug,
+    Subtask,
+    Spike
+});
+choice!(State {
+    Backlog,
+    Ready,
+    InProgress,
+    Blocked,
+    InReview,
+    Done,
+    Canceled
+});
+choice!(Priority {
+    Critical,
+    High,
+    Medium,
+    Low
+});
+choice!(LinkKind {
+    Blocks,
+    RelatesTo,
+    Duplicates
+});
+choice!(SprintState {
+    Planned,
+    Active,
+    Completed
+});
+
+impl State {
+    pub fn terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Canceled)
+    }
+    pub fn permits(self, target: Self) -> bool {
+        use State::*;
+        matches!(
+            (self, target),
+            (Backlog, Ready | Canceled)
+                | (Ready, Backlog | InProgress | Blocked | Canceled)
+                | (InProgress, Ready | Blocked | InReview | Done | Canceled)
+                | (Blocked, Ready | InProgress | Backlog | Canceled)
+                | (InReview, InProgress | Blocked | Done | Canceled)
+                | (Done | Canceled, Backlog)
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Agent {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    pub active: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Project {
+    pub key: String,
+    pub name: String,
+    pub description: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Lease {
+    pub token: String,
+    pub expires_at: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Issue {
+    pub key: String,
+    pub project: String,
+    pub kind: IssueKind,
+    pub title: String,
+    pub description: String,
+    pub acceptance_criteria: Vec<String>,
+    pub state: State,
+    pub priority: Priority,
+    pub assignee: Option<String>,
+    pub parent: Option<String>,
+    pub sprint: Option<String>,
+    pub labels: Vec<String>,
+    pub estimate: Option<f64>,
+    pub metadata: BTreeMap<String, Value>,
+    pub revision: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub lease: Option<Lease>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Link {
+    pub source: String,
+    pub target: String,
+    pub kind: LinkKind,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Comment {
+    pub id: i64,
+    pub issue: String,
+    pub actor: String,
+    pub body: String,
+    pub created_at: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Event {
+    pub id: i64,
+    pub issue: Option<String>,
+    pub actor: String,
+    pub action: String,
+    pub data: Value,
+    pub created_at: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Sprint {
+    pub id: String,
+    pub project: String,
+    pub name: String,
+    pub goal: String,
+    pub state: SprintState,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct IssueFilter {
+    pub project: Option<String>,
+    pub kind: Option<IssueKind>,
+    pub state: Option<State>,
+    pub assignee: Option<String>,
+    pub unassigned: bool,
+    pub parent: Option<String>,
+    pub sprint: Option<String>,
+    pub label: Option<String>,
+    pub text: Option<String>,
+    pub actionable: bool,
+    pub offset: usize,
+    pub limit: Option<usize>,
+}
+
+/// Every operation is available identically through the CLI and MCP.
+/// Revisions are mandatory for editing an existing issue to prevent lost updates.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Command {
+    AgentRegister {
+        id: String,
+        name: String,
+        #[serde(default)]
+        capabilities: Vec<String>,
+    },
+    AgentSetActive {
+        id: String,
+        active: bool,
+    },
+    AgentList {},
+    ProjectCreate {
+        key: String,
+        name: String,
+        #[serde(default)]
+        description: String,
+    },
+    ProjectList {},
+    IssueCreate {
+        project: String,
+        kind: IssueKind,
+        title: String,
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        acceptance_criteria: Vec<String>,
+        #[serde(default)]
+        assignee: Option<String>,
+        #[serde(default)]
+        parent: Option<String>,
+        #[serde(default)]
+        sprint: Option<String>,
+        #[serde(default)]
+        labels: Vec<String>,
+        #[serde(default)]
+        estimate: Option<f64>,
+        #[serde(default)]
+        priority: Option<Priority>,
+        #[serde(default)]
+        metadata: BTreeMap<String, Value>,
+    },
+    IssueGet {
+        key: String,
+    },
+    IssueList {
+        #[serde(default)]
+        filter: IssueFilter,
+    },
+    IssueUpdate {
+        key: String,
+        expected_revision: i64,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        acceptance_criteria: Option<Vec<String>>,
+        #[serde(default)]
+        priority: Option<Priority>,
+        #[serde(default)]
+        labels: Option<Vec<String>>,
+        #[serde(default)]
+        estimate: Option<f64>,
+        #[serde(default)]
+        clear_estimate: bool,
+        #[serde(default)]
+        parent: Option<String>,
+        #[serde(default)]
+        clear_parent: bool,
+        #[serde(default)]
+        sprint: Option<String>,
+        #[serde(default)]
+        clear_sprint: bool,
+        #[serde(default)]
+        metadata: Option<BTreeMap<String, Value>>,
+        #[serde(default)]
+        lease_token: Option<String>,
+    },
+    IssueAssign {
+        key: String,
+        expected_revision: i64,
+        assignee: Option<String>,
+    },
+    IssueTransition {
+        key: String,
+        expected_revision: i64,
+        state: State,
+        #[serde(default)]
+        lease_token: Option<String>,
+    },
+    IssueClaim {
+        project: String,
+        #[serde(default)]
+        key: Option<String>,
+        #[serde(default)]
+        lease_seconds: Option<i64>,
+    },
+    IssueHeartbeat {
+        key: String,
+        lease_token: String,
+        #[serde(default)]
+        lease_seconds: Option<i64>,
+    },
+    IssueRelease {
+        key: String,
+        lease_token: String,
+    },
+    LinkAdd {
+        source: String,
+        target: String,
+        kind: LinkKind,
+    },
+    LinkRemove {
+        source: String,
+        target: String,
+        kind: LinkKind,
+    },
+    CommentAdd {
+        key: String,
+        body: String,
+    },
+    CommentList {
+        key: String,
+        #[serde(default)]
+        after: Option<i64>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    Events {
+        #[serde(default)]
+        key: Option<String>,
+        #[serde(default)]
+        after: Option<i64>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    Board {
+        project: String,
+        #[serde(default)]
+        sprint: Option<String>,
+    },
+    EpicProgress {
+        key: String,
+    },
+    SprintCreate {
+        project: String,
+        name: String,
+        #[serde(default)]
+        goal: String,
+    },
+    SprintList {
+        project: String,
+    },
+    SprintTransition {
+        id: String,
+        state: SprintState,
+    },
+    Workflow {},
+}
