@@ -246,6 +246,50 @@ fn descendants(tx: &Connection, key: &str) -> Result<Vec<Issue>> {
         .filter(|i| i.key != key && found.contains(&i.key))
         .collect())
 }
+
+// Completion depends both on explicit blockers and on finishing children. Checking
+// only explicit link cycles would miss an epic blocking its own descendant.
+fn completion_graph(
+    tx: &Connection,
+    replacement: Option<&Issue>,
+    added: Option<&Link>,
+) -> Result<()> {
+    let mut issues = all::<Issue>(tx, "issues")?;
+    if let Some(issue) = replacement {
+        issues.retain(|i| i.key != issue.key);
+        issues.push(issue.clone());
+    }
+    let mut edges: Vec<(String, String)> = issues
+        .iter()
+        .filter_map(|i| i.parent.as_ref().map(|p| (i.key.clone(), p.clone())))
+        .collect();
+    for l in links(tx)?.into_iter().chain(added.cloned()) {
+        if l.kind == LinkKind::Blocks {
+            edges.push((l.source, l.target));
+        }
+    }
+    let mut remaining: HashSet<_> = issues.into_iter().map(|i| i.key).collect();
+    while !remaining.is_empty() {
+        let roots: Vec<_> = remaining
+            .iter()
+            .filter(|key| {
+                !edges
+                    .iter()
+                    .any(|(source, target)| target == *key && remaining.contains(source))
+            })
+            .cloned()
+            .collect();
+        if roots.is_empty() {
+            return Err(conflict(
+                "dependencies and parent hierarchy must not form a completion cycle",
+            ));
+        }
+        for root in roots {
+            remaining.remove(&root);
+        }
+    }
+    Ok(())
+}
 fn validate_issue(tx: &Connection, issue: &Issue) -> Result<()> {
     nonempty(&issue.title, "title")?;
     if issue.labels.len() > 100
@@ -260,9 +304,6 @@ fn validate_issue(tx: &Connection, issue: &Issue) -> Result<()> {
     }
     if issue.estimate.is_some_and(|e| !e.is_finite() || e < 0.) {
         return Err(invalid("estimate must be finite and nonnegative"));
-    }
-    if let Some(a) = &issue.assignee {
-        active_agent(tx, a)?;
     }
     if let Some(parent) = &issue.parent {
         if parent == &issue.key {
@@ -295,7 +336,9 @@ fn validate_issue(tx: &Connection, issue: &Issue) -> Result<()> {
     }
     if let Some(id) = &issue.sprint {
         let s: Sprint = get(tx, "sprints", id)?;
-        if s.project != issue.project || s.state == SprintState::Completed {
+        if s.project != issue.project
+            || (s.state == SprintState::Completed && !issue.state.terminal())
+        {
             return Err(invalid("sprint must be in same project and not completed"));
         }
         if issue.kind == IssueKind::Epic {
@@ -304,7 +347,7 @@ fn validate_issue(tx: &Connection, issue: &Issue) -> Result<()> {
             ));
         }
     }
-    Ok(())
+    completion_graph(tx, Some(issue), None)
 }
 fn actionable(tx: &Connection, i: &Issue) -> Result<bool> {
     if i.state != State::Ready || i.kind == IssueKind::Epic || !blockers(tx, &i.key)?.is_empty() {
@@ -361,7 +404,11 @@ fn filtered(tx: &Connection, f: &IssueFilter) -> Result<Vec<Issue>> {
                 Priority::Low => 3,
             },
             i.created_at,
-            i.key.clone(),
+            i.key
+                .rsplit('-')
+                .next()
+                .and_then(|n| n.parse::<i64>().ok())
+                .unwrap_or(0),
         )
     });
     Ok(result)
@@ -482,6 +529,9 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
                 updated_at: now(),
                 lease: None,
             };
+            if let Some(a) = &i.assignee {
+                active_agent(tx, a)?;
+            }
             validate_issue(tx, &i)?;
             save(tx, actor, &mut i, "issue_created")
         }
@@ -564,6 +614,10 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
             if clear_sprint {
                 i.sprint = None;
             } else if sprint.is_some() {
+                let s: Sprint = get(tx, "sprints", sprint.as_deref().expect("checked"))?;
+                if s.state == SprintState::Completed {
+                    return Err(conflict("cannot attach work to a completed sprint"));
+                }
                 i.sprint = sprint;
             }
             validate_issue(tx, &i)?;
@@ -580,7 +634,10 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
                 active_agent(tx, a)?;
             }
             // Explicit reassignment revokes a claim and returns interrupted work to ready.
-            if i.lease.is_some() {
+            if i.lease.is_some()
+                || (i.assignee != assignee
+                    && matches!(i.state, State::InProgress | State::InReview))
+            {
                 i.state = State::Ready;
                 i.lease = None;
             }
@@ -602,6 +659,21 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
                     i.state, state
                 )));
             }
+            if i.state.terminal() && !state.terminal() {
+                for link in links(tx)? {
+                    if link.kind == LinkKind::Blocks && link.source == key {
+                        let target: Issue = get(tx, "issues", &link.target)?;
+                        if matches!(
+                            target.state,
+                            State::InProgress | State::InReview | State::Done
+                        ) {
+                            return Err(conflict(
+                                "move dependent issues to backlog, ready or blocked before reopening their blocker",
+                            ));
+                        }
+                    }
+                }
+            }
             if matches!(state, State::InProgress | State::InReview | State::Done) {
                 if !blockers(tx, &key)?.is_empty() {
                     return Err(conflict("unresolved blocking issues"));
@@ -618,12 +690,22 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
             if state.terminal() && descendants(tx, &key)?.iter().any(|c| !c.state.terminal()) {
                 return Err(conflict("close or cancel all descendants first"));
             }
-            if !state.terminal() {
-                if let Some(p) = &i.parent {
-                    let p: Issue = get(tx, "issues", p)?;
-                    if p.state.terminal() {
-                        return Err(conflict("reopen parent first"));
-                    }
+            if !state.terminal()
+                && let Some(p) = &i.parent
+            {
+                let p: Issue = get(tx, "issues", p)?;
+                if p.state.terminal() {
+                    return Err(conflict("reopen parent first"));
+                }
+            }
+            if !state.terminal()
+                && let Some(id) = &i.sprint
+            {
+                let s: Sprint = get(tx, "sprints", id)?;
+                if s.state == SprintState::Completed {
+                    return Err(conflict(
+                        "move issue out of its completed sprint before reopening",
+                    ));
                 }
             }
             i.state = state;
@@ -712,22 +794,15 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
                 return Err(invalid("cannot link an issue to itself"));
             }
             if kind == LinkKind::Blocks {
-                let mut reached = HashSet::from([target.clone()]);
-                let existing = links(tx)?;
-                loop {
-                    let before = reached.len();
-                    for l in &existing {
-                        if l.kind == LinkKind::Blocks && reached.contains(&l.source) {
-                            reached.insert(l.target.clone());
-                        }
-                    }
-                    if before == reached.len() {
-                        break;
-                    }
-                }
-                if reached.contains(&source) {
-                    return Err(conflict("blocking links must not form cycles"));
-                }
+                completion_graph(
+                    tx,
+                    None,
+                    Some(&Link {
+                        source: source.clone(),
+                        target: target.clone(),
+                        kind,
+                    }),
+                )?;
                 let s: Issue = get(tx, "issues", &source)?;
                 if !s.state.terminal()
                     && matches!(t.state, State::InProgress | State::InReview | State::Done)

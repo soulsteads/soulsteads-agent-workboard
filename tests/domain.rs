@@ -277,7 +277,7 @@ fn sprints_filters_pagination_and_agent_lifecycle() {
     f.run(json!({"op":"sprint_transition","id":sprint["id"],"state":"completed"}));
     f.err(
         json!({"op":"issue_update","key":"AG-1","expected_revision":3,"sprint":sprint["id"]}),
-        "invalid",
+        "conflict",
     );
     f.run(json!({"op":"agent_set_active","id":"b","active":false}));
     assert!(
@@ -304,4 +304,133 @@ fn sprints_filters_pagination_and_agent_lifecycle() {
         2
     );
     assert_eq!(f.run(json!({"op":"project_list"}))[0]["key"], "AG");
+}
+
+#[test]
+fn completion_cycles_include_hierarchy_and_reopened_blockers() {
+    let mut f = Fixture::new();
+    f.create("epic", None);
+    f.create("story", Some("AG-1"));
+    f.create("task", None);
+    f.err(
+        json!({"op":"link_add","source":"AG-1","target":"AG-2","kind":"blocks"}),
+        "conflict",
+    );
+    f.run(json!({"op":"link_add","source":"AG-1","target":"AG-3","kind":"blocks"}));
+    f.err(
+        json!({"op":"issue_update","key":"AG-3","expected_revision":1,"parent":"AG-1"}),
+        "conflict",
+    );
+    f.run(json!({"op":"link_remove","source":"AG-1","target":"AG-3","kind":"blocks"}));
+    f.run(json!({"op":"link_add","source":"AG-2","target":"AG-3","kind":"blocks"}));
+    for state in ["ready", "in_progress", "done"] {
+        f.state("AG-2", state);
+    }
+    for state in ["ready", "in_progress", "done"] {
+        f.state("AG-3", state);
+    }
+    let rev = f.issue("AG-2")["revision"].clone();
+    f.err(
+        json!({"op":"issue_transition","key":"AG-2","expected_revision":rev,"state":"backlog"}),
+        "conflict",
+    );
+    f.state("AG-3", "backlog");
+    f.state("AG-2", "backlog");
+}
+
+#[test]
+fn completed_sprint_history_can_be_edited_but_not_reopened_in_place() {
+    let mut f = Fixture::new();
+    let sprint = f.run(json!({"op":"sprint_create","project":"AG","name":"History"}));
+    f.create("task", None);
+    f.run(json!({"op":"issue_update","key":"AG-1","expected_revision":1,"sprint":sprint["id"]}));
+    for state in ["ready", "in_progress", "done"] {
+        f.state("AG-1", state);
+    }
+    f.run(json!({"op":"sprint_transition","id":sprint["id"],"state":"active"}));
+    f.run(json!({"op":"sprint_transition","id":sprint["id"],"state":"completed"}));
+    // Historical records remain editable even when the assigned worker is retired.
+    f.run(json!({"op":"issue_assign","key":"AG-1","expected_revision":5,"assignee":"b"}));
+    f.run(json!({"op":"agent_set_active","id":"b","active":false}));
+    f.run(json!({"op":"issue_update","key":"AG-1","expected_revision":6,"description":"retrospective"}));
+    f.err(
+        json!({"op":"issue_transition","key":"AG-1","expected_revision":7,"state":"backlog"}),
+        "conflict",
+    );
+    f.run(json!({"op":"issue_update","key":"AG-1","expected_revision":7,"clear_sprint":true}));
+    f.state("AG-1", "backlog");
+}
+
+#[test]
+fn blocking_canceling_unassigning_and_incremental_handoffs() {
+    let mut f = Fixture::new();
+    f.create("epic", None);
+    f.create("bug", Some("AG-1"));
+    f.create("task", Some("AG-1"));
+    f.run(json!({"op":"link_add","source":"AG-2","target":"AG-3","kind":"blocks"}));
+    f.state("AG-3", "ready");
+    assert!(
+        f.run(json!({"op":"board","project":"AG"}))["actionable"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    f.state("AG-2", "canceled");
+    assert_eq!(
+        f.run(json!({"op":"board","project":"AG"}))["actionable"][0],
+        "AG-3"
+    );
+    f.state("AG-3", "in_progress");
+    f.state("AG-3", "blocked");
+    f.state("AG-3", "in_progress");
+    let revision = f.issue("AG-3")["revision"].clone();
+    let unassigned = f.run(
+        json!({"op":"issue_assign","key":"AG-3","expected_revision":revision,"assignee":null}),
+    );
+    assert_eq!(unassigned["state"], "ready");
+    assert!(unassigned["assignee"].is_null());
+    f.err(json!({"op":"issue_transition","key":"AG-3","expected_revision":unassigned["revision"],"state":"in_progress"}),"conflict");
+    f.state("AG-3", "canceled");
+    f.state("AG-1", "canceled");
+    let first = f.run(json!({"op":"comment_add","key":"AG-3","body":"Handoff context"}));
+    let second = f.run(json!({"op":"comment_add","key":"AG-3","body":"Validation context"}));
+    let comments = f.run(json!({"op":"comment_list","key":"AG-3","after":first["id"],"limit":1}));
+    assert_eq!(comments[0]["id"], second["id"]);
+    assert_eq!(comments.as_array().unwrap().len(), 1);
+    let page = f.run(json!({"op":"events","key":"AG-3","limit":2}));
+    let cursor = page[1]["id"].clone();
+    let next = f.run(json!({"op":"events","key":"AG-3","after":cursor,"limit":1000}));
+    assert!(
+        next.as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["id"].as_i64() > cursor.as_i64())
+    );
+    assert_eq!(
+        f.run(json!({"op":"epic_progress","key":"AG-1"}))["canceled"],
+        2
+    );
+}
+
+#[test]
+fn cross_project_integrity_priorities_and_future_schema_rejection() {
+    let mut f = Fixture::new();
+    f.run(json!({"op":"project_create","key":"OTHER","name":"Other"}));
+    f.create("epic", None);
+    f.err(json!({"op":"issue_create","project":"OTHER","kind":"story","title":"bad parent","parent":"AG-1"}),"invalid");
+    let sprint = f.run(json!({"op":"sprint_create","project":"OTHER","name":"Other sprint"}));
+    f.err(json!({"op":"issue_create","project":"AG","kind":"task","title":"bad sprint","sprint":sprint["id"]}),"invalid");
+    for priority in ["low", "critical", "high"] {
+        let i=f.run(json!({"op":"issue_create","project":"AG","kind":"task","title":priority,"priority":priority}));
+        f.state(i["key"].as_str().unwrap(), "ready");
+    }
+    let claimed = f.run(json!({"op":"issue_claim","project":"AG"}))["claimed"].clone();
+    assert_eq!(claimed["priority"], "critical");
+    f.err(json!({"op":"issue_heartbeat","key":claimed["key"],"lease_token":claimed["lease"]["token"],"lease_seconds":0}),"invalid");
+    let conn = rusqlite::Connection::open(f.dir.path().join("test.sqlite3")).unwrap();
+    conn.pragma_update(None, "user_version", 2).unwrap();
+    assert!(matches!(
+        Store::open(f.dir.path().join("test.sqlite3")),
+        Err(Error::Invalid(_))
+    ));
 }
