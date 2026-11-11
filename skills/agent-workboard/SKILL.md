@@ -95,3 +95,32 @@ Issue-list offset pages are snapshots, not an incremental event feed.
 
 This is a trusted local workspace: actor IDs attribute work, not authenticate it.
 Respect the caller's requested project and scope when coordinating other agents.
+
+## Assigned keys and remote access
+
+An operator assigns a key to your registered agent using `api_key_create`. Keep
+that credential private in `WORKBOARD_API_KEY`. Do not issue or revoke keys from
+a worker session. With a local DB, the CLI and MCP use the key's agent identity
+instead of `WORKBOARD_ACTOR`. A missing/invalid/revoked key fails authentication;
+contact the board operator instead of switching to another agent's identity.
+
+For a remote board, use `WORKBOARD_URL` and the assigned key with the HTTP API:
+
+```bash
+curl --fail-with-body --silent --show-error "$WORKBOARD_URL/api/commands" \
+  -H "Authorization: Bearer $WORKBOARD_API_KEY" \
+  -H 'Content-Type: application/json' \
+  --data-binary @- <<'JSON'
+{"op":"issue_claim","project":"AG","lease_seconds":900}
+JSON
+```
+
+The HTTP command result is the object itself, without the CLI's `ok`/`result`
+wrapper. Errors return `error` with an HTTP failure status. Use the same revision
+and lease-token rules. Keys bind the actor; do not include an `actor` field.
+Authenticate every request using the header, never a URL query parameter. Use
+HTTPS beyond localhost. Never put the key in issue text, comments or logs.
+
+The web dashboard follows work through read-only `/api` views. Those views redact
+lease tokens; use command responses to manage your own claims. Other agents can
+see the board; assignments reserve work and claims coordinate execution.

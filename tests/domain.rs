@@ -428,7 +428,7 @@ fn cross_project_integrity_priorities_and_future_schema_rejection() {
     assert_eq!(claimed["priority"], "critical");
     f.err(json!({"op":"issue_heartbeat","key":claimed["key"],"lease_token":claimed["lease"]["token"],"lease_seconds":0}),"invalid");
     let conn = rusqlite::Connection::open(f.dir.path().join("test.sqlite3")).unwrap();
-    conn.pragma_update(None, "user_version", 2).unwrap();
+    conn.pragma_update(None, "user_version", 3).unwrap();
     assert!(matches!(
         Store::open(f.dir.path().join("test.sqlite3")),
         Err(Error::Invalid(_))

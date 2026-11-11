@@ -2,6 +2,7 @@ use crate::model::*;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     path::Path,
@@ -166,7 +167,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 1 {
+        if version > 2 {
             return Err(invalid("database schema is newer than this binary"));
         }
         conn.execute_batch("BEGIN IMMEDIATE;
@@ -181,9 +182,88 @@ impl Store {
             CREATE INDEX IF NOT EXISTS comments_issue ON comments(issue,id);
             CREATE INDEX IF NOT EXISTS events_issue ON events(issue,id);
             CREATE INDEX IF NOT EXISTS issues_project ON issues(json_extract(doc,'$.project'));
-            PRAGMA user_version=1;
+            CREATE TABLE IF NOT EXISTS api_keys(id TEXT PRIMARY KEY,agent TEXT NOT NULL REFERENCES agents(id),label TEXT NOT NULL,key_hash TEXT NOT NULL UNIQUE,created_at INTEGER NOT NULL,revoked_at INTEGER);
+            PRAGMA user_version=2;
             COMMIT;")?;
         Ok(Self { conn })
+    }
+    /// HTTP identity comes exclusively from a live key and active registry entry.
+    pub fn authenticate(&self, token: &str) -> Result<Option<Agent>> {
+        if token.len() != 67 || !token.starts_with("wb_") {
+            return Ok(None);
+        }
+        let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT agent FROM api_keys WHERE key_hash=?1 AND revoked_at IS NULL",
+                [hash],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match id {
+            Some(id) => {
+                let a: Agent = get(&self.conn, "agents", &id)?;
+                Ok(a.active.then_some(a))
+            }
+            None => Ok(None),
+        }
+    }
+    /// Consistent, read-only snapshot for the observer dashboard. Does not recover
+    /// leases or emit events; merely viewing work must not change agent state.
+    pub fn observation(&mut self, project: Option<&str>) -> Result<Value> {
+        let tx = self.conn.transaction()?;
+        let projects = all::<Project>(&tx, "projects")?;
+        let selected = project
+            .map(str::to_owned)
+            .or_else(|| projects.first().map(|p| p.key.clone()));
+        if let Some(key) = &selected {
+            let _: Project = get(&tx, "projects", key)?;
+        }
+        let issues: Vec<_> = all::<Issue>(&tx, "issues")?
+            .into_iter()
+            .filter(|i| Some(&i.project) == selected.as_ref())
+            .collect();
+        let sprints: Vec<_> = all::<Sprint>(&tx, "sprints")?
+            .into_iter()
+            .filter(|s| Some(&s.project) == selected.as_ref())
+            .collect();
+        let activity = observation_events(&tx, selected.as_deref(), None, None)?;
+        let value = json!({"projects":projects,"project":selected,"agents":all::<Agent>(&tx,"agents")?,"issues":issues,"sprints":sprints,"activity":activity,"server_time":now()});
+        tx.commit()?;
+        Ok(value)
+    }
+    pub fn observation_issue(&mut self, key: &str) -> Result<Value> {
+        let tx = self.conn.transaction()?;
+        let mut context = execute(&tx, "observer", Command::IssueGet { key: key.into() })?;
+        context["comments"] = observation_comments(&tx, key, None)?;
+        context["activity"] = observation_events(&tx, None, Some(key), None)?;
+        tx.commit()?;
+        Ok(context)
+    }
+    pub fn observation_activity(
+        &mut self,
+        project: Option<&str>,
+        key: Option<&str>,
+        before: Option<i64>,
+    ) -> Result<Value> {
+        let tx = self.conn.transaction()?;
+        if let Some(p) = project {
+            let _: Project = get(&tx, "projects", p)?;
+        }
+        if let Some(k) = key {
+            let _: Issue = get(&tx, "issues", k)?;
+        }
+        let value = observation_events(&tx, project, key, before)?;
+        tx.commit()?;
+        Ok(value)
+    }
+    pub fn observation_comments(&mut self, key: &str, before: Option<i64>) -> Result<Value> {
+        let tx = self.conn.transaction()?;
+        let _: Issue = get(&tx, "issues", key)?;
+        let value = observation_comments(&tx, key, before)?;
+        tx.commit()?;
+        Ok(value)
     }
     pub fn execute(&mut self, actor: &str, command: Command) -> Result<Value> {
         identifier(actor)?;
@@ -417,6 +497,7 @@ fn read_only(c: &Command) -> bool {
     matches!(
         c,
         Command::AgentList {}
+            | Command::ApiKeyList { .. }
             | Command::ProjectList {}
             | Command::IssueGet { .. }
             | Command::IssueList { .. }
@@ -431,7 +512,9 @@ fn read_only(c: &Command) -> bool {
 
 fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
     use Command::*;
-    if !read_only(&c) && !matches!(&c,AgentRegister{id,..} if id==actor) {
+    if (!read_only(&c) || matches!(&c, ApiKeyList { .. }))
+        && !matches!(&c,AgentRegister{id,..} if id==actor)
+    {
         active_agent(tx, actor)?;
     }
     match c {
@@ -467,6 +550,56 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
             Ok(json!(a))
         }
         AgentList {} => Ok(json!(all::<Agent>(tx, "agents")?)),
+        ApiKeyCreate { agent, label } => {
+            active_agent(tx, &agent)?;
+            nonempty(&label, "label")?;
+            let secret = format!(
+                "wb_{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+            let hash = format!("{:x}", Sha256::digest(secret.as_bytes()));
+            let key = ApiKey {
+                id: uuid::Uuid::new_v4().to_string(),
+                agent,
+                label,
+                created_at: now(),
+                revoked_at: None,
+            };
+            tx.execute(
+                "INSERT INTO api_keys(id,agent,label,key_hash,created_at) VALUES(?1,?2,?3,?4,?5)",
+                params![key.id, key.agent, key.label, hash, key.created_at],
+            )?;
+            event(tx, actor, None, "api_key_created", json!(key))?;
+            Ok(json!({"key":key,"api_key":secret}))
+        }
+        ApiKeyList { agent } => {
+            if let Some(id) = &agent {
+                let _: Agent = get(tx, "agents", id)?;
+            }
+            let mut stmt = tx.prepare("SELECT id,agent,label,created_at,revoked_at FROM api_keys WHERE (?1 IS NULL OR agent=?1) ORDER BY created_at,id")?;
+            let rows = stmt.query_map([agent], |r| {
+                Ok(ApiKey {
+                    id: r.get(0)?,
+                    agent: r.get(1)?,
+                    label: r.get(2)?,
+                    created_at: r.get(3)?,
+                    revoked_at: r.get(4)?,
+                })
+            })?;
+            Ok(json!(rows.collect::<std::result::Result<Vec<_>, _>>()?))
+        }
+        ApiKeyRevoke { id } => {
+            let changed = tx.execute(
+                "UPDATE api_keys SET revoked_at=?1 WHERE id=?2 AND revoked_at IS NULL",
+                params![now(), id],
+            )?;
+            if changed == 0 {
+                return Err(conflict("key is missing or already revoked"));
+            }
+            event(tx, actor, None, "api_key_revoked", json!({"id":id}))?;
+            Ok(json!({"id":id,"revoked":true}))
+        }
         ProjectCreate {
             key,
             name,
@@ -1059,4 +1192,68 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
             )
         }
     }
+}
+
+// Newest-first cursor pages for a monitoring feed; independent of the agents'
+// forward event cursors used for synchronization.
+fn observation_events(
+    tx: &Connection,
+    project: Option<&str>,
+    key: Option<&str>,
+    before: Option<i64>,
+) -> Result<Value> {
+    let mut stmt = tx.prepare("SELECT id,issue,actor,action,data,created_at FROM events e
+        WHERE (?1 IS NULL OR e.issue IN (SELECT id FROM issues WHERE json_extract(doc,'$.project')=?1)
+            OR (e.issue IS NULL AND (e.action LIKE 'agent_%' OR json_extract(e.data,'$.project')=?1 OR (e.action='project_created' AND json_extract(e.data,'$.key')=?1))))
+        AND (?2 IS NULL OR e.issue=?2) AND (?3 IS NULL OR e.id<?3)
+        ORDER BY id DESC LIMIT 101")?;
+    let rows = stmt.query_map(params![project, key, before], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, i64>(5)?,
+        ))
+    })?;
+    let mut items = Vec::new();
+    for row in rows {
+        let (id, issue, actor, action, data, created_at) = row?;
+        items.push(Event {
+            id,
+            issue,
+            actor,
+            action,
+            data: serde_json::from_str(&data)?,
+            created_at,
+        });
+    }
+    let next = if items.len() > 100 {
+        items.truncate(100);
+        items.last().map(|e| e.id)
+    } else {
+        None
+    };
+    Ok(json!({"items":items,"next_before":next}))
+}
+fn observation_comments(tx: &Connection, key: &str, before: Option<i64>) -> Result<Value> {
+    let mut stmt = tx.prepare("SELECT id,issue,actor,body,created_at FROM comments WHERE issue=?1 AND (?2 IS NULL OR id<?2) ORDER BY id DESC LIMIT 101")?;
+    let rows = stmt.query_map(params![key, before], |r| {
+        Ok(Comment {
+            id: r.get(0)?,
+            issue: r.get(1)?,
+            actor: r.get(2)?,
+            body: r.get(3)?,
+            created_at: r.get(4)?,
+        })
+    })?;
+    let mut items = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    let next = if items.len() > 100 {
+        items.truncate(100);
+        items.last().map(|c| c.id)
+    } else {
+        None
+    };
+    Ok(json!({"items":items,"next_before":next}))
 }

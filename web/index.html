@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <meta
+      name="description"
+      content="A live view of the work your agents are doing."
+    />
+    <title>Agent Workboard</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to workspace</a>
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="Agent Workboard home"
+        ><span class="brand-mark">s<span>·</span></span
+        ><span
+          >soulsteads<span class="brand-caption">AGENT WORKBOARD</span></span
+        ></a
+      >
+      <div class="workspace-label">WORKSPACE</div>
+      <label class="project-label" for="project">Project</label>
+      <select id="project" aria-label="Project">
+        <option value="">Loading projects…</option>
+      </select>
+      <nav aria-label="Workspace views">
+        <button class="nav-item selected" data-view="board" aria-current="page">
+          <span aria-hidden="true">▦</span> Issue board
+        </button>
+        <button class="nav-item" data-view="agents">
+          <span aria-hidden="true">◉</span> Agents
+          <span id="nav-agent-count" class="nav-count">0</span>
+        </button>
+        <button class="nav-item" data-view="activity">
+          <span aria-hidden="true">↗</span> Activity
+        </button>
+      </nav>
+      <div class="sidebar-bottom">
+        <span class="observer-symbol" aria-hidden="true">◌</span>
+        <div>Observer mode<small>Agents run. You stay in the loop.</small></div>
+        <span class="read-only">READ ONLY</span>
+      </div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <div class="breadcrumb">
+          Workspace <span>/</span> <strong id="breadcrumb">All work</strong>
+        </div>
+        <div class="connection">
+          <span id="connection-dot" class="live-dot"></span
+          ><span id="connection" role="status">Connecting</span
+          ><button id="sign-out" class="text-button">Sign out</button
+          ><button
+            id="refresh"
+            class="icon-button"
+            aria-label="Refresh workspace"
+            title="Refresh workspace"
+          >
+            ↻
+          </button>
+        </div>
+      </header>
+      <main id="main" tabindex="-1">
+        <div class="page-heading">
+          <div>
+            <div class="eyebrow">THE WORK, IN MOTION</div>
+            <h1 id="page-title">Issue board</h1>
+            <p id="page-description">
+              A clear view of what your agents are building.
+            </p>
+          </div>
+          <div class="heading-note">
+            <span class="pulse-ring" aria-hidden="true"></span> Updates every 3
+            seconds
+          </div>
+        </div>
+        <div id="error" class="error-banner" role="alert" hidden></div>
+        <section
+          id="metrics"
+          class="metrics"
+          aria-label="Project summary"
+        ></section>
+        <div id="filters" class="toolbar">
+          <label class="search"
+            ><span aria-hidden="true">⌕</span
+            ><input
+              id="search"
+              type="search"
+              placeholder="Search issues, keys, or labels…"
+              aria-label="Search issues"
+          /></label>
+          <div class="filter-group">
+            <select id="assignee" aria-label="Filter by agent">
+              <option value="">All agents</option>
+            </select>
+            <select id="kind" aria-label="Filter by issue type">
+              <option value="">All types</option>
+              <option value="epic">Epics</option>
+              <option value="story">Stories</option>
+              <option value="task">Tasks</option>
+              <option value="bug">Bugs</option>
+              <option value="subtask">Subtasks</option>
+              <option value="spike">Spikes</option>
+            </select>
+            <select id="sprint" aria-label="Filter by sprint">
+              <option value="">All sprints</option>
+            </select>
+            <button id="clear-filters" class="text-button" hidden>
+              Clear filters
+            </button>
+          </div>
+        </div>
+        <div class="section-heading">
+          <h2 id="section-title">
+            All issues <span id="issue-count" class="count">0</span>
+          </h2>
+          <span id="section-note">Grouped by status</span>
+        </div>
+        <section id="content" aria-label="Workspace content" aria-busy="true">
+          <div class="empty-state">
+            <div class="empty-icon">▦</div>
+            <h2>Connecting to your workboard</h2>
+            <p>Loading the latest work from your agents.</p>
+          </div>
+        </section>
+        <footer class="footer">
+          <span>Built for agents. Visible to you.</span
+          ><span id="updated">Waiting for the first update</span>
+        </footer>
+      </main>
+    </div>
+    <dialog id="auth-dialog" aria-labelledby="auth-title">
+      <form id="auth-form" class="auth-form">
+        <div class="eyebrow">SOULSTEADS · AGENT WORKBOARD</div>
+        <h2 id="auth-title">Your agents, in view.</h2>
+        <p>Connect with an assigned agent API key to follow the work.</p>
+        <label for="api-key">API key</label>
+        <input
+          id="api-key"
+          name="api-key"
+          type="password"
+          autocomplete="off"
+          placeholder="wb_…"
+          required
+        />
+        <p id="auth-error" role="alert" hidden></p>
+        <button id="connect" type="submit">
+          Connect to workboard <span aria-hidden="true">→</span>
+        </button>
+        <small
+          >Your key stays in this browser tab. Access can be revoked by the
+          board operator.</small
+        >
+      </form>
+    </dialog>
+    <dialog id="issue-dialog" aria-labelledby="detail-title">
+      <div class="detail-header">
+        <span id="detail-key" class="mono"></span
+        ><button
+          id="close-detail"
+          class="icon-button"
+          aria-label="Close issue details"
+        >
+          ×
+        </button>
+      </div>
+      <div id="detail-content"></div>
+    </dialog>
+  </body>
+</html>

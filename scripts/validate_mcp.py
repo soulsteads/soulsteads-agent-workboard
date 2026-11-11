@@ -30,8 +30,10 @@ async def validate(binary: Path, database: Path):
 
     cli({"op": "agent_register", "id": "worker", "name": "SDK worker"})
     cli({"op": "project_create", "key": "SDK", "name": "SDK validation"})
+    credential = cli({"op": "api_key_create", "agent": "worker", "label": "Disposable SDK key"})
     parameters = StdioServerParameters(
-        command=str(binary), args=["--db", str(database), "--actor", "worker", "mcp"],
+        command=str(binary), args=["--db", str(database), "mcp"],
+        env={"WORKBOARD_API_KEY": credential["api_key"]},
     )
     async with stdio_client(parameters) as (read, write):
         async with ClientSession(read, write) as session:
@@ -85,11 +87,20 @@ async def validate(binary: Path, database: Path):
             assert error.structuredContent["error"]["code"] == "not_found"
             invalid = await session.call_tool("workboard_execute", {"op": "issue_claim", "project": "SDK", "typo": True})
             assert invalid.isError
+            # Key-bound sessions cannot administer keys, and revocation is checked
+            # again even for a server that is already connected.
             await session.send_ping()
+            cli({"op": "api_key_revoke", "id": credential["key"]["id"]})
+            try:
+                await session.list_resources()
+            except Exception as error:
+                assert "revoked" in str(error), str(error)
+            else:
+                raise AssertionError("revoked key still had access")
     board = cli({"op": "board", "project": "SDK"})
     assert len(board["columns"]["done"]) == 3
     assert cli({"op": "comment_list", "key": story["key"]})[0]["actor"] == "worker"
-    print("PASS: official MCP SDK handshake, command schema, tools, resources, prompts, errors, full issue work loop, and shared CLI persistence")
+    print("PASS: key-bound official MCP SDK handshake and live revocation, command schema, tools, resources, prompts, errors, full issue work loop, and shared CLI persistence")
 
 
 if __name__ == "__main__":

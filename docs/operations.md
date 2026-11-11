@@ -160,3 +160,69 @@ unknown methods and malformed RPC parameters use protocol errors. Notifications
 produce no response. JSON-RPC batches are unsupported, as required by current MCP.
 Input frames are limited to 8 MiB. Oversized MCP frames terminate the transport;
 reconnect and reconcile state before retrying work.
+
+## HTTP access
+
+`workboard web` serves the embedded dashboard and HTTP API. Every `/api` endpoint
+requires `Authorization: Bearer <api_key>` for an active registered agent. Missing,
+invalid and revoked keys return 401. The key determines the actor for mutations.
+Keys grant board-wide coordination access in the trusted agent pool, not only
+access to assigned issues. The browser UI is read-only, but an agent key permits
+API mutations. Local DB/CLI/MCP operator access remains trusted by OS permissions.
+
+| Endpoint | Behavior |
+| --- | --- |
+| `GET /` | Dashboard assets/login shell; no board data until authenticated |
+| `GET /api/schema` | Complete command JSON Schema for remote discovery |
+| `GET /api/session` | Authenticated agent identity |
+| `GET /api/overview?project=AG` | Consistent project snapshot; projects, agents, issues, sprints, recent activity, server clock; defaults to the first project |
+| `GET /api/activity?project=AG&before=123` | Newest-first activity page, scoped to project issue/sprint/project changes and global agent registry changes |
+| `GET /api/issues/AG-1` | Issue, links, blockers, children, recent comments and history |
+| `GET /api/issues/AG-1/events?before=123` | Newest-first issue history page |
+| `GET /api/issues/AG-1/comments?before=123` | Newest-first comments page |
+| `POST /api/commands` | Any non-key-management command JSON; executes as the key's agent |
+
+Observer pages contain `items` and `next_before` (null at the end), 100 items per
+page. `before` is exclusive. These backward cursors are separate from the command
+API's forward `after` cursors. Observer responses recursively remove fencing
+tokens from leases, including historical event payloads. Authenticated command
+responses preserve worker tokens so claims/heartbeats can be used by agents.
+Observer reads do not recover expired leases, change issue revisions, or append
+events. The UI shows expired claims until a worker recovers them via claim.
+
+POST commands return their result directly on success, without a CLI wrapper.
+Domain errors return `{"error":{"code":"...","message":"..."}}`: invalid fields
+400, not found 404, conflicts 409, internal errors 500. Malformed command JSON is
+rejected by the JSON extractor (400/422 depending on syntax/type). The HTTP JSON
+body limit is 2 MiB. Unsupported methods return 405. Authentication failures are
+401, and remote key management returns 403. No CORS access is enabled.
+
+All responses are `Cache-Control: no-store`, with a restrictive Content Security
+Policy, `nosniff` and no referrer forwarding. The UI renders issue/comment text as
+text, never HTML, including metadata and event snapshots. API keys live in the
+browser tab's session storage, never URLs. They are removed on sign-out or 401.
+Use HTTPS when making the service accessible beyond localhost.
+
+### Assigned API keys
+
+| Command (local operator only) | Required fields | Result |
+| --- | --- | --- |
+| `api_key_create` | `agent`, `label` | `key` metadata and one-time `api_key` secret |
+| `api_key_list` | None; optional `agent` filter | Metadata only, including revoked keys |
+| `api_key_revoke` | `id` | Revokes one key; subsequent requests fail |
+
+Use an unkeyed local CLI/MCP operator session with a registered active actor to
+administer keys. Key-authenticated HTTP, CLI and MCP sessions cannot issue, list
+or revoke keys. Keys contain 244 random bits from two UUID v4 values; only their
+SHA-256 digest is stored in the schema-2 `api_keys` table. Secrets are not recorded
+in events. Key metadata includes id, agent, label, created_at and revoked_at.
+Deactivate an agent to disable all its keys without deleting history; reactivation
+restores its unrevoked keys. For permanent removal, revoke each key.
+
+`WORKBOARD_API_KEY` (or CLI `--api-key`) enables key-bound CLI/MCP access and
+overrides `--actor`. Prefer the environment variable to avoid credentials in
+process arguments. CLI checks the key before its single command; MCP rechecks
+on every RPC request, including resource reads. MCP rejection of an invalid or
+revoked key uses protocol error -32001. Without a key these local interfaces
+retain trusted operator semantics. Agents on other hosts use the HTTP API rather
+than sharing SQLite files over a network filesystem.

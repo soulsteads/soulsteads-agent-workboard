@@ -72,6 +72,14 @@ pub struct Agent {
     pub active: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ApiKey {
+    pub id: String,
+    pub agent: String,
+    pub label: String,
+    pub created_at: i64,
+    pub revoked_at: Option<i64>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Project {
     pub key: String,
     pub name: String,
@@ -168,6 +176,18 @@ pub enum Command {
         active: bool,
     },
     AgentList {},
+    /// Local administration only; the secret is returned once and stored hashed.
+    ApiKeyCreate {
+        agent: String,
+        label: String,
+    },
+    ApiKeyList {
+        #[serde(default)]
+        agent: Option<String>,
+    },
+    ApiKeyRevoke {
+        id: String,
+    },
     ProjectCreate {
         key: String,
         name: String,
@@ -315,4 +335,13 @@ pub enum Command {
         state: SprintState,
     },
     Workflow {},
+}
+
+impl Command {
+    pub fn is_key_management(&self) -> bool {
+        matches!(
+            self,
+            Self::ApiKeyCreate { .. } | Self::ApiKeyList { .. } | Self::ApiKeyRevoke { .. }
+        )
+    }
 }

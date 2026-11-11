@@ -32,6 +32,7 @@ pub struct Server {
     store: Store,
     actor: String,
     initialized: bool,
+    api_key: Option<String>,
 }
 impl Server {
     pub fn new(store: Store, actor: String) -> Self {
@@ -39,7 +40,12 @@ impl Server {
             store,
             actor,
             initialized: false,
+            api_key: None,
         }
+    }
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key;
+        self
     }
     /// Notifications never produce a response. Invalid requests preserve JSON-RPC errors.
     pub fn handle(&mut self, request: Value) -> Option<Value> {
@@ -64,6 +70,19 @@ impl Server {
         }
         let method = method.expect("checked");
         let id = id?;
+        if let Some(key) = &self.api_key {
+            match self.store.authenticate(key) {
+                Ok(Some(agent)) => self.actor = agent.id,
+                Ok(None) => {
+                    return Some(rpc_error(
+                        id,
+                        -32001,
+                        "API key is invalid, revoked, or belongs to an inactive agent",
+                    ));
+                }
+                Err(_) => return Some(rpc_error(id, -32603, "authentication unavailable")),
+            }
+        }
         let params = request.get("params").cloned().unwrap_or(json!({}));
         let result = match method {
             "initialize" => {
@@ -100,7 +119,16 @@ impl Server {
                 match serde_json::from_value::<Command>(
                     params.get("arguments").cloned().unwrap_or(json!({})),
                 ) {
-                    Ok(command) => tool_result(self.store.execute(&self.actor, command)),
+                    Ok(command) => {
+                        if self.api_key.is_some() && command.is_key_management() {
+                            return Some(rpc_error(
+                                id,
+                                -32001,
+                                "key administration requires local operator mode",
+                            ));
+                        }
+                        tool_result(self.store.execute(&self.actor, command))
+                    }
                     Err(error) => tool_result(Err(crate::Error::Invalid(error.to_string()))),
                 }
             }

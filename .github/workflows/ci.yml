@@ -1,7 +1,7 @@
 name: validate
 on: [push, pull_request]
 jobs:
-  rust-and-mcp:
+  rust-mcp-and-web:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,3 +14,10 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --locked --release
       - run: uv run --locked scripts/validate_mcp.py target/release/workboard
+      - run: uv run --locked scripts/validate_web.py target/release/workboard --install-browser --with-deps --screenshots artifacts/web
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: web-browser-qa
+          path: artifacts/web
+          if-no-files-found: ignore
