@@ -10,11 +10,11 @@ use hmac::{Hmac, Mac};
 use serde_json::json;
 use sha2::Sha256;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::{sync::watch, task::JoinSet};
+use tokio::{sync::watch, task::JoinSet, time::Instant};
 
 /// Consecutive failures before a webhook is paused (about four hours of outage).
 pub const MAX_FAILURES: u32 = 25;
@@ -92,12 +92,19 @@ fn send(agent: &ureq::Agent, target: &WebhookTarget, event: &Event) -> Result<()
 }
 
 enum Outcome {
-    /// Everything available was delivered, or there was nothing to deliver.
+    /// Nothing to deliver, or delivery stopped without scheduling a retry.
     Settled,
+    /// The cursor advanced; check for another batch without waiting for a poll.
+    Progress,
     Failed {
-        id: String,
         failures: u32,
+        failure_recorded: bool,
     },
+}
+
+struct Retry {
+    deadline: Instant,
+    failure_recorded: bool,
 }
 
 /// Delivers one webhook's pending events in order, stopping at the first failure.
@@ -113,6 +120,12 @@ fn deliver(db: &Database, agent: &ureq::Agent, target: WebhookTarget) -> Outcome
         Err(_) => return Outcome::Settled,
     };
     for event in &events {
+        if !lock()
+            .and_then(|s| s.webhook_is_active(&id).map_err(|e| e.to_string()))
+            .unwrap_or(false)
+        {
+            return Outcome::Settled;
+        }
         match send(agent, &target, event) {
             Ok(()) => {
                 if lock()
@@ -126,21 +139,26 @@ fn deliver(db: &Database, agent: &ureq::Agent, target: WebhookTarget) -> Outcome
                 }
             }
             Err(message) => {
-                let failures = lock()
-                    .and_then(|mut s| {
-                        s.webhook_fail(&id, &message, MAX_FAILURES)
-                            .map_err(|e| e.to_string())
-                    })
-                    .unwrap_or(1);
-                return Outcome::Failed { id, failures };
+                let recorded = lock().and_then(|mut s| {
+                    s.webhook_fail(&id, &message, MAX_FAILURES)
+                        .map_err(|e| e.to_string())
+                });
+                return Outcome::Failed {
+                    failures: recorded.as_ref().copied().unwrap_or(1),
+                    failure_recorded: recorded.is_ok(),
+                };
             }
         }
     }
-    if scan_end > target.webhook.cursor {
-        let _ = lock().and_then(|mut s| {
-            s.webhook_ack(&id, scan_end, false)
-                .map_err(|e| e.to_string())
-        });
+    if scan_end > target.webhook.cursor
+        && lock()
+            .and_then(|mut s| {
+                s.webhook_ack(&id, scan_end, false)
+                    .map_err(|e| e.to_string())
+            })
+            .is_ok()
+    {
+        return Outcome::Progress;
     }
     Outcome::Settled
 }
@@ -152,7 +170,12 @@ fn backoff(failures: u32) -> Duration {
 /// deliveries start immediately instead of at the next poll.
 pub async fn run(db: Database, mut wake: watch::Receiver<u64>) {
     let agent = agent();
-    let mut retry_at: HashMap<String, Instant> = HashMap::new();
+    let mut retry_at: HashMap<String, Retry> = HashMap::new();
+    let mut checked = HashSet::new();
+    let mut running = HashMap::new();
+    let mut tasks = JoinSet::new();
+    let mut poll_at = Instant::now() + POLL;
+    let mut wake_open = true;
     loop {
         let targets = {
             let db = db.clone();
@@ -165,30 +188,69 @@ pub async fn run(db: Database, mut wake: watch::Receiver<u64>) {
             .unwrap_or_default()
         };
         retry_at.retain(|id, _| targets.iter().any(|t| &t.webhook.id == id));
-        let mut tasks = JoinSet::new();
+        checked.retain(|id| targets.iter().any(|t| &t.webhook.id == id));
         for target in targets {
+            let id = target.webhook.id.clone();
+            if running.values().any(|active| active == &id) || checked.contains(&id) {
+                continue;
+            }
+            // Zero means an operator reset only if we previously persisted a failure.
+            // A failed write also leaves zero, but must retain its fallback deadline.
+            if target.webhook.failures == 0
+                && retry_at
+                    .get(&id)
+                    .is_some_and(|retry| retry.failure_recorded)
+            {
+                retry_at.remove(&id);
+            }
             if retry_at
-                .get(&target.webhook.id)
-                .is_some_and(|until| *until > Instant::now())
+                .get(&id)
+                .is_some_and(|retry| retry.deadline > Instant::now())
             {
                 continue;
             }
-            retry_at.remove(&target.webhook.id);
+            retry_at.remove(&id);
+            checked.insert(id.clone());
             let (db, agent) = (db.clone(), agent.clone());
-            tasks.spawn_blocking(move || deliver(&db, &agent, target));
+            let task = tasks.spawn_blocking(move || deliver(&db, &agent, target));
+            running.insert(task.id(), id);
         }
-        while let Some(done) = tasks.join_next().await {
-            if let Ok(Outcome::Failed { id, failures }) = done {
-                retry_at.insert(id, Instant::now() + backoff(failures));
-            }
-        }
+        let next_check = retry_at
+            .values()
+            .map(|retry| retry.deadline)
+            .min()
+            .unwrap_or(poll_at)
+            .min(poll_at);
         tokio::select! {
-            changed = wake.changed() => {
-                if changed.is_err() {
-                    tokio::time::sleep(POLL).await;
+            Some(done) = tasks.join_next_with_id(), if !tasks.is_empty() => {
+                let (task_id, outcome) = match done {
+                    Ok(done) => done,
+                    Err(error) => (error.id(), Outcome::Settled),
+                };
+                if let Some(id) = running.remove(&task_id) {
+                    match outcome {
+                        Outcome::Progress => { checked.remove(&id); }
+                        Outcome::Failed { failures, failure_recorded } => {
+                            checked.remove(&id);
+                            retry_at.insert(id, Retry {
+                                deadline: Instant::now() + backoff(failures),
+                                failure_recorded,
+                            });
+                        }
+                        Outcome::Settled => {}
+                    }
                 }
             }
-            _ = tokio::time::sleep(POLL) => {}
+            changed = wake.changed(), if wake_open => {
+                wake_open = changed.is_ok();
+                checked.clear();
+            }
+            _ = tokio::time::sleep_until(next_check) => {
+                if Instant::now() >= poll_at {
+                    poll_at = Instant::now() + POLL;
+                    checked.clear();
+                }
+            }
         }
     }
 }
