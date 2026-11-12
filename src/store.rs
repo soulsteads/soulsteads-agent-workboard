@@ -157,6 +157,78 @@ fn limit(n: Option<usize>) -> Result<usize> {
     }
 }
 
+/// How long a retried mutation is recognized and answered from the stored result.
+const IDEMPOTENCY_TTL: i64 = 24 * 60 * 60;
+const MAX_WEBHOOKS: i64 = 50;
+
+fn idempotency_key(key: &str) -> Result<()> {
+    if key.is_empty()
+        || key.len() > 128
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+    {
+        return Err(invalid(
+            "idempotency key must be 1-128 ASCII letters, digits, '_', '-', '.' or ':'",
+        ));
+    }
+    Ok(())
+}
+/// Shows enough of a destination to recognize it without exposing path or query
+/// secrets, which services such as chat webhooks embed in their URLs.
+fn mask_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "…".into();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    if rest.len() == authority.len() {
+        format!("{scheme}://{host}")
+    } else {
+        format!("{scheme}://{host}/…")
+    }
+}
+fn masked(webhook: &Webhook) -> Result<Value> {
+    let mut value = serde_json::to_value(webhook)?;
+    value["url"] = json!(mask_url(&webhook.url));
+    Ok(value)
+}
+fn validate_webhook_url(url: &str) -> Result<()> {
+    let uri: ureq::http::Uri = url
+        .parse()
+        .map_err(|_| invalid("webhook url must be a valid absolute http or https URL"))?;
+    let scheme_ok = matches!(uri.scheme_str(), Some("http" | "https"));
+    if url.len() > 2048 || !scheme_ok || uri.host().is_none_or(str::is_empty) {
+        return Err(invalid(
+            "webhook url must be an absolute http or https URL of at most 2048 bytes",
+        ));
+    }
+    Ok(())
+}
+fn latest_event(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT COALESCE(MAX(id),0) FROM events", [], |r| r.get(0))?)
+}
+fn update_webhook(tx: &Connection, webhook: &Webhook) -> Result<()> {
+    tx.execute(
+        "UPDATE webhooks SET doc=?2 WHERE id=?1",
+        params![webhook.id, encode(webhook)?],
+    )?;
+    Ok(())
+}
+fn webhook_by_id(tx: &Connection, id: &str) -> Result<Option<Webhook>> {
+    match get(tx, "webhooks", id) {
+        Ok(webhook) => Ok(Some(webhook)),
+        Err(Error::NotFound(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// An active webhook with the secret needed to sign its deliveries.
+pub struct WebhookTarget {
+    pub webhook: Webhook,
+    pub secret: String,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -167,7 +239,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 2 {
+        if version > 3 {
             return Err(invalid("database schema is newer than this binary"));
         }
         conn.execute_batch("BEGIN IMMEDIATE;
@@ -183,7 +255,10 @@ impl Store {
             CREATE INDEX IF NOT EXISTS events_issue ON events(issue,id);
             CREATE INDEX IF NOT EXISTS issues_project ON issues(json_extract(doc,'$.project'));
             CREATE TABLE IF NOT EXISTS api_keys(id TEXT PRIMARY KEY,agent TEXT NOT NULL REFERENCES agents(id),label TEXT NOT NULL,key_hash TEXT NOT NULL UNIQUE,created_at INTEGER NOT NULL,revoked_at INTEGER);
-            PRAGMA user_version=2;
+            CREATE TABLE IF NOT EXISTS idempotency(actor TEXT NOT NULL,key TEXT NOT NULL,request_hash TEXT NOT NULL,response TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(actor,key));
+            CREATE INDEX IF NOT EXISTS idempotency_created ON idempotency(created_at);
+            CREATE TABLE IF NOT EXISTS webhooks(id TEXT PRIMARY KEY,doc TEXT NOT NULL CHECK(json_valid(doc)),secret TEXT NOT NULL);
+            PRAGMA user_version=3;
             COMMIT;")?;
         Ok(Self { conn })
     }
@@ -273,6 +348,160 @@ impl Store {
         let result = execute(&tx, actor, command)?;
         tx.commit()?;
         Ok(result)
+    }
+    /// Runs a command at most once per `(actor, key)` for 24 hours. A retry with the
+    /// same key and command returns the original result and `true` without touching
+    /// the board; the same key with a different command is a conflict. The record
+    /// commits atomically with the mutation, so a crash can never leave one without
+    /// the other. Administrative commands are excluded because their results carry
+    /// secrets that must not be stored for replay.
+    pub fn execute_idempotent(
+        &mut self,
+        actor: &str,
+        key: Option<&str>,
+        command: Command,
+    ) -> Result<(Value, bool)> {
+        let Some(key) = key else {
+            return self.execute(actor, command).map(|v| (v, false));
+        };
+        identifier(actor)?;
+        idempotency_key(key)?;
+        if command.is_operator_only() {
+            return Err(invalid(
+                "idempotency keys are not supported for administrative commands",
+            ));
+        }
+        if read_only(&command) {
+            return self.execute(actor, command).map(|v| (v, false));
+        }
+        let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&command)?));
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<(String, String)> = tx
+            .query_row(
+                "SELECT request_hash,response FROM idempotency WHERE actor=?1 AND key=?2 AND created_at>?3",
+                params![actor, key, now() - IDEMPOTENCY_TTL],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((previous_hash, response)) = previous {
+            if previous_hash != hash {
+                return Err(conflict(
+                    "idempotency key was already used with a different command",
+                ));
+            }
+            return Ok((serde_json::from_str(&response)?, true));
+        }
+        let result = execute(&tx, actor, command)?;
+        tx.execute(
+            "DELETE FROM idempotency WHERE created_at<=?1 OR (actor=?2 AND key=?3)",
+            params![now() - IDEMPOTENCY_TTL, actor, key],
+        )?;
+        tx.execute(
+            "INSERT INTO idempotency(actor,key,request_hash,response,created_at) VALUES(?1,?2,?3,?4,?5)",
+            params![actor, key, hash, encode(&result)?, now()],
+        )?;
+        tx.commit()?;
+        Ok((result, false))
+    }
+    /// Validates a stream scope and picks its starting point: an explicit cursor, or
+    /// the newest event so that a fresh stream carries only what happens next.
+    pub fn stream_cursor(&self, project: Option<&str>, after: Option<i64>) -> Result<i64> {
+        if let Some(key) = project {
+            let _: Project = get(&self.conn, "projects", key)?;
+        }
+        match after {
+            Some(cursor) if cursor < 0 => Err(invalid("after must not be negative")),
+            Some(cursor) => Ok(cursor),
+            None => latest_event(&self.conn),
+        }
+    }
+    /// Events with ids above `after`, oldest first, optionally scoped to one project.
+    pub fn events_after(
+        &self,
+        project: Option<&str>,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        events_forward(&self.conn, project, after, limit)
+    }
+    /// Active webhooks with their signing secrets, oldest first.
+    pub fn webhook_targets(&self) -> Result<Vec<WebhookTarget>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT doc,secret FROM webhooks ORDER BY rowid")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut targets = vec![];
+        for row in rows {
+            let (doc, secret) = row?;
+            let webhook: Webhook = serde_json::from_str(&doc)?;
+            if webhook.active {
+                targets.push(WebhookTarget { webhook, secret });
+            }
+        }
+        Ok(targets)
+    }
+    /// The next events a webhook should receive, plus the id of the last event
+    /// examined. Events the webhook filters out must still advance its cursor, or
+    /// a run of unrelated events would stall delivery.
+    pub fn webhook_batch(&self, webhook: &Webhook, limit: usize) -> Result<(Vec<Event>, i64)> {
+        let scanned = events_forward(
+            &self.conn,
+            webhook.project.as_deref(),
+            webhook.cursor,
+            limit,
+        )?;
+        let scan_end = scanned.last().map_or(webhook.cursor, |e| e.id);
+        let matching = scanned
+            .into_iter()
+            .filter(|e| webhook.actions.is_empty() || webhook.actions.contains(&e.action))
+            .collect();
+        Ok((matching, scan_end))
+    }
+    /// Records progress. The cursor never moves backwards and a webhook deleted in
+    /// the meantime is ignored.
+    pub fn webhook_ack(&mut self, id: &str, cursor: i64, delivered: bool) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(mut webhook) = webhook_by_id(&tx, id)? {
+            webhook.cursor = webhook.cursor.max(cursor);
+            webhook.failures = 0;
+            webhook.last_error = None;
+            if delivered {
+                webhook.last_delivered_at = Some(now());
+            }
+            update_webhook(&tx, &webhook)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// Counts a failed delivery. After `max_failures` in a row the webhook is paused
+    /// and a `webhook_disabled` event is recorded. Returns the failure count.
+    pub fn webhook_fail(&mut self, id: &str, error: &str, max_failures: u32) -> Result<u32> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut failures = 0;
+        if let Some(mut webhook) = webhook_by_id(&tx, id)? {
+            webhook.failures += 1;
+            failures = webhook.failures;
+            webhook.last_error = Some(error.chars().take(200).collect());
+            if webhook.failures >= max_failures {
+                webhook.active = false;
+                event(
+                    &tx,
+                    "system",
+                    None,
+                    "webhook_disabled",
+                    json!({"id":webhook.id,"label":webhook.label,"project":webhook.project,"failures":webhook.failures}),
+                )?;
+            }
+            update_webhook(&tx, &webhook)?;
+        }
+        tx.commit()?;
+        Ok(failures)
     }
 }
 
@@ -507,12 +736,13 @@ fn read_only(c: &Command) -> bool {
             | Command::EpicProgress { .. }
             | Command::SprintList { .. }
             | Command::Workflow {}
+            | Command::WebhookList {}
     )
 }
 
 fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
     use Command::*;
-    if (!read_only(&c) || matches!(&c, ApiKeyList { .. }))
+    if (!read_only(&c) || matches!(&c, ApiKeyList { .. } | WebhookList {}))
         && !matches!(&c,AgentRegister{id,..} if id==actor)
     {
         active_agent(tx, actor)?;
@@ -599,6 +829,100 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
             }
             event(tx, actor, None, "api_key_revoked", json!({"id":id}))?;
             Ok(json!({"id":id,"revoked":true}))
+        }
+        WebhookCreate {
+            url,
+            label,
+            project,
+            actions,
+        } => {
+            nonempty(&label, "label")?;
+            validate_webhook_url(&url)?;
+            if let Some(key) = &project {
+                let _: Project = get(tx, "projects", key)?;
+            }
+            if actions.len() > 50 || actions.iter().any(|a| a.is_empty() || a.len() > 64) {
+                return Err(invalid("actions allow at most 50 names of 1-64 bytes each"));
+            }
+            let existing: i64 = tx.query_row("SELECT COUNT(*) FROM webhooks", [], |r| r.get(0))?;
+            if existing >= MAX_WEBHOOKS {
+                return Err(conflict(format!(
+                    "at most {MAX_WEBHOOKS} webhooks are allowed"
+                )));
+            }
+            let secret = format!(
+                "whsec_{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+            let mut webhook = Webhook {
+                id: uuid::Uuid::new_v4().to_string(),
+                label,
+                url,
+                project,
+                actions,
+                active: true,
+                cursor: 0,
+                failures: 0,
+                last_error: None,
+                last_delivered_at: None,
+                created_at: now(),
+            };
+            tx.execute(
+                "INSERT INTO webhooks(id,doc,secret) VALUES(?1,?2,?3)",
+                params![webhook.id, encode(&webhook)?, secret],
+            )?;
+            // The URL is deliberately absent: activity feeds are visible to every agent.
+            event(
+                tx,
+                actor,
+                None,
+                "webhook_created",
+                json!({"id":webhook.id,"label":webhook.label,"project":webhook.project,"actions":webhook.actions}),
+            )?;
+            // Only future events are delivered, not the history that predates the webhook.
+            webhook.cursor = latest_event(tx)?;
+            update_webhook(tx, &webhook)?;
+            Ok(json!({"webhook":masked(&webhook)?,"secret":secret}))
+        }
+        WebhookList {} => Ok(json!(
+            all::<Webhook>(tx, "webhooks")?
+                .iter()
+                .map(masked)
+                .collect::<Result<Vec<_>>>()?
+        )),
+        WebhookSetActive { id, active } => {
+            let mut webhook: Webhook = get(tx, "webhooks", &id)?;
+            webhook.active = active;
+            if active {
+                webhook.failures = 0;
+                webhook.last_error = None;
+            }
+            update_webhook(tx, &webhook)?;
+            event(
+                tx,
+                actor,
+                None,
+                if active {
+                    "webhook_resumed"
+                } else {
+                    "webhook_paused"
+                },
+                json!({"id":webhook.id,"label":webhook.label,"project":webhook.project}),
+            )?;
+            masked(&webhook)
+        }
+        WebhookDelete { id } => {
+            let webhook: Webhook = get(tx, "webhooks", &id)?;
+            tx.execute("DELETE FROM webhooks WHERE id=?1", [&id])?;
+            event(
+                tx,
+                actor,
+                None,
+                "webhook_deleted",
+                json!({"id":webhook.id,"label":webhook.label,"project":webhook.project}),
+            )?;
+            Ok(json!({"id":id,"deleted":true}))
         }
         ProjectCreate {
             key,
@@ -1194,6 +1518,47 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
     }
 }
 
+// Events that belong to a project: its issues, plus project-level and agent events.
+// Parameter ?1 is the project key, or NULL for every event.
+const EVENT_SCOPE: &str = "(?1 IS NULL OR e.issue IN (SELECT id FROM issues WHERE json_extract(doc,'$.project')=?1)
+    OR (e.issue IS NULL AND (e.action LIKE 'agent_%' OR json_extract(e.data,'$.project')=?1 OR (e.action='project_created' AND json_extract(e.data,'$.key')=?1))))";
+
+// Oldest-first events after a cursor, for push streams and webhook delivery.
+fn events_forward(
+    tx: &Connection,
+    project: Option<&str>,
+    after: i64,
+    limit: usize,
+) -> Result<Vec<Event>> {
+    let mut stmt = tx.prepare(&format!(
+        "SELECT id,issue,actor,action,data,created_at FROM events e
+        WHERE e.id>?2 AND {EVENT_SCOPE} ORDER BY e.id LIMIT ?3"
+    ))?;
+    let rows = stmt.query_map(params![project, after, limit as i64], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, i64>(5)?,
+        ))
+    })?;
+    let mut events = vec![];
+    for row in rows {
+        let (id, issue, actor, action, data, created_at) = row?;
+        events.push(Event {
+            id,
+            issue,
+            actor,
+            action,
+            data: serde_json::from_str(&data)?,
+            created_at,
+        });
+    }
+    Ok(events)
+}
+
 // Newest-first cursor pages for a monitoring feed; independent of the agents'
 // forward event cursors used for synchronization.
 fn observation_events(
@@ -1202,11 +1567,12 @@ fn observation_events(
     key: Option<&str>,
     before: Option<i64>,
 ) -> Result<Value> {
-    let mut stmt = tx.prepare("SELECT id,issue,actor,action,data,created_at FROM events e
-        WHERE (?1 IS NULL OR e.issue IN (SELECT id FROM issues WHERE json_extract(doc,'$.project')=?1)
-            OR (e.issue IS NULL AND (e.action LIKE 'agent_%' OR json_extract(e.data,'$.project')=?1 OR (e.action='project_created' AND json_extract(e.data,'$.key')=?1))))
+    let mut stmt = tx.prepare(&format!(
+        "SELECT id,issue,actor,action,data,created_at FROM events e
+        WHERE {EVENT_SCOPE}
         AND (?2 IS NULL OR e.issue=?2) AND (?3 IS NULL OR e.id<?3)
-        ORDER BY id DESC LIMIT 101")?;
+        ORDER BY id DESC LIMIT 101"
+    ))?;
     let rows = stmt.query_map(params![project, key, before], |r| {
         Ok((
             r.get::<_, i64>(0)?,

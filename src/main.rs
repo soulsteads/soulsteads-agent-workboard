@@ -31,7 +31,13 @@ struct Args {
 #[derive(Subcommand)]
 enum Mode {
     /// Execute one command JSON; omit JSON or pass '-' to read stdin.
-    Run { json: Option<String> },
+    Run {
+        json: Option<String>,
+        /// Make a retry safe: repeating the same command with the same key returns the
+        /// original result (with "replayed":true) instead of applying it twice.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
     /// Print the complete JSON Schema for commands (does not open the database).
     Schema,
     /// Run the MCP JSON-RPC stdio server. Never emits non-protocol stdout.
@@ -85,7 +91,10 @@ fn run(mut args: Args) -> Result<(), serde_json::Value> {
         }
     }
     match args.mode {
-        Mode::Run { json: input } => {
+        Mode::Run {
+            json: input,
+            idempotency_key,
+        } => {
             let input = match input {
                 Some(s) if s != "-" => s,
                 _ => {
@@ -102,13 +111,19 @@ fn run(mut args: Args) -> Result<(), serde_json::Value> {
             };
             let command: Command = serde_json::from_str(&input)
                 .map_err(|e| json!({"code":"invalid","message":e.to_string()}))?;
-            if args.api_key.is_some() && command.is_key_management() {
+            if args.api_key.is_some() && command.is_operator_only() {
                 return Err(
-                    json!({"code":"forbidden","message":"Key administration requires local operator mode without an API key"}),
+                    json!({"code":"forbidden","message":"Key and webhook administration requires local operator mode without an API key"}),
                 );
             }
-            let result = store.execute(&args.actor, command).map_err(|e| e.json())?;
-            println!("{}", json!({"ok":true,"result":result}));
+            let (result, replayed) = store
+                .execute_idempotent(&args.actor, idempotency_key.as_deref(), command)
+                .map_err(|e| e.json())?;
+            if replayed {
+                println!("{}", json!({"ok":true,"result":result,"replayed":true}));
+            } else {
+                println!("{}", json!({"ok":true,"result":result}));
+            }
         }
         Mode::Mcp => {
             if let Err(e) = mcp::serve(

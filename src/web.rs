@@ -1,21 +1,73 @@
 //! Embedded observer dashboard and authenticated agent HTTP access.
-use crate::{Agent, Command, Error, Store};
+use crate::{Agent, Command, Error, Event, Store, redact_leases, webhooks::Database};
 use axum::{
     Extension, Json, Router,
     extract::{Path, Query, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event as Sse, KeepAlive, Sse as SseResponse},
+    },
     routing::{get, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
+    collections::VecDeque,
+    convert::Infallible,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
+use tokio::sync::watch;
 
-type Database = Arc<Mutex<Store>>;
+/// How often a stream re-checks the log for writes made by other processes.
+const STREAM_POLL: Duration = Duration::from_secs(1);
+
+/// Wakes push consumers (event streams and webhook delivery) after a write, and
+/// tells open streams to finish when the server shuts down.
+pub struct Hub {
+    wake: watch::Sender<u64>,
+    closing: AtomicBool,
+}
+impl Hub {
+    pub fn new() -> Self {
+        Self {
+            wake: watch::channel(0).0,
+            closing: AtomicBool::new(false),
+        }
+    }
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.wake.subscribe()
+    }
+    pub fn notify(&self) {
+        self.wake.send_modify(|n| *n = n.wrapping_add(1));
+    }
+    pub fn close(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+        self.notify();
+    }
+    fn closing(&self) -> bool {
+        self.closing.load(Ordering::SeqCst)
+    }
+}
+impl Default for Hub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+/// The caller's key, kept so that a long-lived stream can notice its revocation.
+#[derive(Clone)]
+struct Token(String);
+#[derive(Default, Deserialize)]
+struct StreamQuery {
+    project: Option<String>,
+    after: Option<i64>,
+}
 #[derive(Default, Deserialize)]
 struct Browse {
     project: Option<String>,
@@ -23,7 +75,11 @@ struct Browse {
 }
 
 pub fn router(store: Store) -> Router {
-    let db = Arc::new(Mutex::new(store));
+    shared_router(Arc::new(Mutex::new(store)), Arc::new(Hub::new()))
+}
+/// Builds the application over a database and hub that other tasks, such as
+/// webhook delivery, also use.
+pub fn shared_router(db: Database, hub: Arc<Hub>) -> Router {
     let api = Router::new()
         .route(
             "/schema",
@@ -38,6 +94,7 @@ pub fn router(store: Store) -> Router {
         .route("/issues/{key}", get(issue))
         .route("/issues/{key}/events", get(issue_activity))
         .route("/issues/{key}/comments", get(comments))
+        .route("/events/stream", get(stream))
         .route("/commands", post(command))
         .route_layer(middleware::from_fn_with_state(db.clone(), authenticate));
     Router::new()
@@ -71,6 +128,7 @@ pub fn router(store: Store) -> Router {
             )
         })
         .with_state(db)
+        .layer(Extension(hub))
         .layer(middleware::from_fn(headers))
 }
 fn asset(content_type: &'static str, body: &'static str) -> impl IntoResponse {
@@ -108,6 +166,7 @@ async fn authenticate(
     else {
         return unauthorized();
     };
+    let held = token.clone();
     let result = tokio::task::spawn_blocking(move || {
         db.lock()
             .map_err(|_| ())
@@ -117,6 +176,7 @@ async fn authenticate(
     match result {
         Ok(Ok(Some(agent))) => {
             request.extensions_mut().insert(agent);
+            request.extensions_mut().insert(Token(held));
             next.run(request).await
         }
         Ok(Ok(None)) => unauthorized(),
@@ -127,29 +187,27 @@ async fn authenticate(
             .into_response(),
     }
 }
-/// Leases are displayed by expiry, never by their worker fencing credential.
-fn redact(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            if let Some(Value::Object(lease)) = object.get_mut("lease") {
-                lease.remove("token");
-            }
-            for child in object.values_mut() {
-                redact(child);
-            }
-        }
-        Value::Array(array) => {
-            for child in array {
-                redact(child);
-            }
-        }
-        _ => {}
-    }
+fn failure(error: Error) -> Response {
+    let status = match error {
+        Error::NotFound(_) => StatusCode::NOT_FOUND,
+        Error::Invalid(_) => StatusCode::BAD_REQUEST,
+        Error::Conflict(_) => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(json!({"error":error.json()}))).into_response()
 }
 async fn query(
     db: Database,
-    redact_leases: bool,
+    redact: bool,
     f: impl FnOnce(&mut Store) -> Result<Value, Error> + Send + 'static,
+) -> Response {
+    query_replayable(db, redact, move |s| f(s).map(|v| (v, false))).await
+}
+/// Like `query`, marking answers that were replayed from an earlier identical request.
+async fn query_replayable(
+    db: Database,
+    redact: bool,
+    f: impl FnOnce(&mut Store) -> Result<(Value, bool), Error> + Send + 'static,
 ) -> Response {
     let result = tokio::task::spawn_blocking(move || {
         let mut store = db
@@ -159,21 +217,19 @@ async fn query(
     })
     .await;
     match result {
-        Ok(Ok(mut value)) => {
-            if redact_leases {
-                redact(&mut value);
+        Ok(Ok((mut value, replayed))) => {
+            if redact {
+                redact_leases(&mut value);
             }
-            Json(value).into_response()
+            let mut response = Json(value).into_response();
+            if replayed {
+                response
+                    .headers_mut()
+                    .insert("idempotent-replayed", HeaderValue::from_static("true"));
+            }
+            response
         }
-        Ok(Err(error)) => {
-            let status = match error {
-                Error::NotFound(_) => StatusCode::NOT_FOUND,
-                Error::Invalid(_) => StatusCode::BAD_REQUEST,
-                Error::Conflict(_) => StatusCode::CONFLICT,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            (status, Json(json!({"error":error.json()}))).into_response()
-        }
+        Ok(Err(error)) => failure(error),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error":{"code":"internal","message":"observer unavailable"}})),
@@ -213,12 +269,137 @@ async fn comments(
 async fn command(
     State(db): State<Database>,
     Extension(agent): Extension<Agent>,
+    Extension(hub): Extension<Arc<Hub>>,
+    headers: HeaderMap,
     Json(command): Json<Command>,
 ) -> Response {
-    if command.is_key_management() {
-        return (StatusCode::FORBIDDEN, Json(json!({"error":{"code":"forbidden","message":"Manage API keys locally through the CLI or MCP"}}))).into_response();
+    if command.is_operator_only() {
+        return (StatusCode::FORBIDDEN, Json(json!({"error":{"code":"forbidden","message":"Manage API keys and webhooks locally through the CLI or MCP"}}))).into_response();
     }
-    query(db, false, move |s| s.execute(&agent.id, command)).await
+    let key = match headers.get("idempotency-key").map(|v| v.to_str()) {
+        None => None,
+        Some(Ok(key)) => Some(key.to_owned()),
+        Some(Err(_)) => {
+            return failure(Error::Invalid("Idempotency-Key must be plain ASCII".into()));
+        }
+    };
+    let response = query_replayable(db, false, move |s| {
+        s.execute_idempotent(&agent.id, key.as_deref(), command)
+    })
+    .await;
+    if response.status().is_success() {
+        hub.notify();
+    }
+    response
+}
+
+struct StreamState {
+    db: Database,
+    hub: Arc<Hub>,
+    wake: watch::Receiver<u64>,
+    token: String,
+    project: Option<String>,
+    cursor: i64,
+    pending: VecDeque<Event>,
+}
+/// Server-sent events for everything that happens on the board.
+///
+/// A new stream carries only future events; `after` (or the `Last-Event-ID` header
+/// that browsers resend on reconnect) resumes from an event id, with `after=0`
+/// replaying the whole log. Each message's `id` is the event id, its `event` is the
+/// action, and its `data` is the event as JSON with lease tokens removed. The
+/// stream ends when the key is revoked, so clients reconnect and learn why.
+async fn stream(
+    State(db): State<Database>,
+    Extension(hub): Extension<Arc<Hub>>,
+    Extension(Token(token)): Extension<Token>,
+    headers: HeaderMap,
+    Query(q): Query<StreamQuery>,
+) -> Response {
+    let resume = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<i64>().ok());
+    // Subscribing first means a write landing during setup still wakes the stream.
+    let wake = hub.subscribe();
+    let start = {
+        let (db, project, after) = (db.clone(), q.project.clone(), resume.or(q.after));
+        tokio::task::spawn_blocking(move || {
+            db.lock()
+                .map_err(|_| Error::Invalid("stream unavailable".into()))?
+                .stream_cursor(project.as_deref(), after)
+        })
+        .await
+    };
+    let cursor = match start {
+        Ok(Ok(cursor)) => cursor,
+        Ok(Err(error)) => return failure(error),
+        Err(_) => {
+            return failure(Error::Invalid("stream unavailable".into()));
+        }
+    };
+    let state = StreamState {
+        db,
+        hub,
+        wake,
+        token,
+        project: q.project,
+        cursor,
+        pending: VecDeque::new(),
+    };
+    let events = futures_util::stream::unfold(state, |mut st| async move {
+        loop {
+            if let Some(event) = st.pending.pop_front() {
+                st.cursor = event.id;
+                let mut value = serde_json::to_value(&event).unwrap_or(Value::Null);
+                redact_leases(&mut value);
+                let message = Sse::default()
+                    .id(event.id.to_string())
+                    .event(event.action)
+                    .data(value.to_string());
+                return Some((Ok::<_, Infallible>(message), st));
+            }
+            if st.hub.closing() {
+                return None;
+            }
+            let (db, token, project, cursor) = (
+                st.db.clone(),
+                st.token.clone(),
+                st.project.clone(),
+                st.cursor,
+            );
+            let fetched = tokio::task::spawn_blocking(move || {
+                let store = db.lock().ok()?;
+                // Revocation or deactivation ends the stream on the next check.
+                matches!(store.authenticate(&token), Ok(Some(_))).then_some(())?;
+                store.events_after(project.as_deref(), cursor, 100).ok()
+            })
+            .await
+            .ok()
+            .flatten();
+            match fetched {
+                None => return None,
+                Some(events) if !events.is_empty() => st.pending.extend(events),
+                Some(_) => {
+                    tokio::select! {
+                        changed = st.wake.changed() => {
+                            if changed.is_err() {
+                                tokio::time::sleep(STREAM_POLL).await;
+                            }
+                        }
+                        _ = tokio::time::sleep(STREAM_POLL) => {}
+                    }
+                }
+            }
+        }
+    });
+    SseResponse::new(events)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        )
+        .into_response()
 }
 
 pub async fn serve(store: Store, address: SocketAddr) -> std::io::Result<()> {
@@ -227,9 +408,17 @@ pub async fn serve(store: Store, address: SocketAddr) -> std::io::Result<()> {
         "Agent Workboard · http://{} · API key required",
         listener.local_addr()?
     );
-    axum::serve(listener, router(store))
-        .with_graceful_shutdown(async {
+    let db = Arc::new(Mutex::new(store));
+    let hub = Arc::new(Hub::new());
+    let delivery = tokio::spawn(crate::webhooks::run(db.clone(), hub.subscribe()));
+    let closing = hub.clone();
+    let result = axum::serve(listener, shared_router(db, hub))
+        .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
+            // Open event streams would otherwise keep the server from stopping.
+            closing.close();
         })
-        .await
+        .await;
+    delivery.abort();
+    result
 }

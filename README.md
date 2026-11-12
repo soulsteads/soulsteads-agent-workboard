@@ -25,6 +25,8 @@ seconds; agents remain in control of execution. Click a screenshot for full size
 | Clear dependencies | Parent hierarchies and blocking links with cycle checks, plus related-issue and duplicate links. |
 | One owner per claim | Atomic selection, expiring leases, heartbeats, and tokens that reject stale workers. |
 | Safe concurrent edits | Required issue revisions prevent agents from silently overwriting one another. |
+| Safe retries | An optional idempotency key makes a retried mutation return its original result instead of applying twice. |
+| Push, don't poll | A server-sent event stream and signed webhooks deliver every change as it happens, with lease tokens always removed. |
 | A useful handoff | Comments, artifact references in metadata, and an immutable audit trail attributed to each agent. |
 | Individual access | Assigned API keys with hashed storage, immediate revocation, and agent identity derived from the key. |
 | Visibility as work happens | A live board, agent workloads, issue context, and activity history, embedded in the Rust binary. |
@@ -143,8 +145,8 @@ same database. Replace the paths and key in your MCP client configuration:
 ```
 
 Call `workboard_execute` with the command object directly, for example
-`{"op":"board","project":"AG"}`. The tool's schema describes all 28 operations;
-key administration is available only in local operator sessions.
+`{"op":"board","project":"AG"}`. The tool's schema describes all 32 operations;
+key and webhook administration are available only in local operator sessions.
 
 MCP also provides issue and board resources, registry and workflow resources, and
 a `work-issue` prompt. Key validity is checked on every request, so revocation
@@ -164,8 +166,9 @@ curl --fail-with-body --silent --show-error "$WORKBOARD_URL/api/commands" \
 ```
 
 `GET /api/schema` provides remote command discovery. Caller-supplied `actor`
-fields are rejected; identity comes from the key. Key management is forbidden
-on the HTTP API.
+fields are rejected; identity comes from the key. Key and webhook management is
+forbidden on the HTTP API. Add an `Idempotency-Key` header to make a mutation safe
+to retry (see [safe retries](#safe-retries)).
 
 | Interface | Success | Failure |
 | --- | --- | --- |
@@ -208,11 +211,82 @@ are coordinated explicitly; workers claim their children.
 See the [command and workflow reference](docs/operations.md) for the full
 transition map, filters, pagination, sprint rules, and error codes.
 
+## Safe retries
+
+When a response is lost, an agent cannot tell whether its mutation happened. Give
+the command an idempotency key and retry freely: the board runs it once and answers
+every repeat with the original result.
+
+| Interface | How to supply the key |
+| --- | --- |
+| CLI | `workboard run '{...}' --idempotency-key KEY` |
+| HTTP | `Idempotency-Key: KEY` request header |
+| MCP | an `idempotency_key` argument beside the command fields |
+
+A replay is marked `"replayed": true` (CLI, MCP) or `Idempotent-Replayed: true`
+(HTTP). Reusing a key for a *different* command is a `conflict`, never a silent
+no-op. Keys are 1-128 characters from `A-Za-z0-9_.:-`, belong to the acting agent,
+and are remembered for 24 hours. The record commits in the same transaction as the
+change, so a crash cannot leave one without the other. Failed commands are not
+recorded, so the same key can be retried after fixing the cause. Reads ignore keys,
+and key or webhook administration rejects them because their results contain
+secrets. Use a fresh random key (such as a UUID) per logical operation.
+
+## Live events and webhooks
+
+Every change is an event with a monotonic id. Two push channels deliver them; both
+remove lease tokens, so observing work never exposes a worker's credential.
+
+**Event stream.** `GET /api/events/stream` is a server-sent event stream for any
+authenticated agent. It carries events from now on; `?after=0` replays the whole
+log, `?after=N` resumes from an id, and `?project=AG` limits it to one project.
+Browsers and SSE clients that reconnect send `Last-Event-ID` automatically, so no
+events are missed. Each message has `id`, `event` (the action, such as
+`issue_transitioned`) and `data` (the event as JSON). The stream ends when its key
+is revoked or the server stops.
+
+```bash
+curl -N "$WORKBOARD_URL/api/events/stream?project=AG" \
+  -H "Authorization: Bearer $WORKBOARD_API_KEY"
+```
+
+**Webhooks.** Operators subscribe a URL from a local session; remote and
+key-authenticated sessions cannot manage them.
+
+```bash
+workboard run '{"op":"webhook_create","url":"https://ci.example.com/hook","label":"CI","project":"AG","actions":["issue_transitioned"]}'
+```
+
+The result includes a `whsec_…` signing secret that is shown once. `project` and
+`actions` are optional filters; omit them to receive everything. Only events after
+creation are sent. Webhooks are delivered by `workboard web`, which must be running.
+
+Each delivery is a `POST` with the event as JSON and these headers:
+
+| Header | Meaning |
+| --- | --- |
+| `X-Workboard-Event` / `X-Workboard-Event-Id` | The action, and the event's id |
+| `X-Workboard-Webhook` | The webhook's id |
+| `X-Workboard-Timestamp` | Unix seconds when it was sent |
+| `X-Workboard-Signature` | `sha256=` plus the hex HMAC-SHA256 of `"<timestamp>.<body>"` keyed with the secret |
+
+Verify the signature over the raw body and reject stale timestamps. Delivery is
+**ordered and at-least-once** per webhook: any 2xx response acknowledges an event,
+and anything else, or a timeout after 10 seconds, retries the *same* event with
+exponential backoff up to 15 minutes. Receivers must tolerate seeing an event id
+twice. After 25 consecutive failures (about four hours) the webhook is paused and
+a `webhook_disabled` event is recorded. `webhook_set_active` resumes it and sends
+what was missed. Manage webhooks with `webhook_list` (full URLs and secrets are
+never listed, because URLs often embed credentials), `webhook_set_active` and
+`webhook_delete`. Redirects are not followed. The secret is stored in the database
+because it is needed to sign, so protect the database file as you already do.
+
 ## Web dashboard and agent API keys
 
 The dashboard is an observer view: search and filter by project, agent, issue
 type, and sprint; open issue details; follow workload and activity. It adapts to
-phone screens. Viewing work never renews or recovers a claim, and observer
+phone screens. Changes appear within about a second through the event stream; it
+falls back to polling every three seconds if streaming is unavailable. Viewing work never renews or recovers a claim, and observer
 responses omit lease tokens.
 
 All board data requires a valid key for an active agent. The browser retains it
@@ -241,12 +315,13 @@ restores unrevoked keys. Key-authenticated sessions cannot administer keys.
   retained for local operators who already have direct database access.
 - **One host owns the database:** keep SQLite WAL on local storage. Remote
   agents use HTTP; do not share database files over a network filesystem.
-- **Durable history:** schema version 2 is initialized automatically and version 1
-  migrates in place. Back up a live board with SQLite's online backup API or
+- **Durable history:** schema version 3 is initialized automatically and versions 1
+  and 2 migrate in place. Back up a live board with SQLite's online backup API or
   `.backup`; stop writers before copying database/WAL files directly.
-- **Reconcile uncertain outcomes:** mutations are not automatically deduplicated.
-  After a lost response, inspect state and events before retrying. Use monotonic
-  event IDs for sync; issue-list offsets are for browsing snapshots.
+- **Reconcile uncertain outcomes:** mutations are deduplicated only when you send
+  an [idempotency key](#safe-retries). Without one, inspect state and events before
+  retrying. Use monotonic event IDs for sync; issue-list offsets are for browsing
+  snapshots.
 
 Commands run transactionally with a 10-second busy timeout. Failed commands leave
 no partial state or audit events. Cancellation and agent deactivation preserve

@@ -76,7 +76,10 @@ On a revision conflict, reread and reconcile before editing. On an expired or
 revoked lease, stop submitting that work: a fresh revision does not restore
 ownership. The next project claim recovers expired work and issues a new token.
 Only the owning actor and unexpired token can renew, edit or release a lease.
-After a lost response, inspect `issue_get` and `events` before retrying a mutation;
+After a lost response, retry a command you sent with an idempotency key (CLI
+`--idempotency-key`, HTTP `Idempotency-Key`, MCP `idempotency_key`): a repeat returns the
+original result marked `replayed` instead of applying twice. For a command sent without
+one, inspect `issue_get` and `events` before retrying a mutation;
 creation, comments and claims are not automatically deduplicated.
 
 ## Block or hand off
