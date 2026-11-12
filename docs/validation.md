@@ -12,8 +12,8 @@ uv run --locked scripts/validate_mcp.py target/release/workboard
 uv run --locked scripts/validate_web.py target/release/workboard --install-browser
 ```
 
-Validated on Linux with Rust/Cargo 1.99.1. The Rust suite has 21 integration tests
-(10 domain tests, 4 interface/process tests, and 7 web/authentication tests). Development dependencies for the
+Validated on Linux with Rust/Cargo 1.99.1. The Rust suite has 38 integration tests
+(10 domain, 4 interface/process, 7 web/authentication, and 17 push tests) plus 2 unit tests. Development dependencies for the
 SDK validator are pinned in `scripts/validate_mcp.py.lock` and `scripts/validate_web.py.lock`; Rust dependencies are
 pinned in `Cargo.lock`. The command engine, HTTP server, CLI and MCP are Rust; the embedded dashboard
 uses plain JavaScript and CSS. Python is used only for independent SDK and
@@ -33,6 +33,9 @@ browser integration validation.
 | Sprints and planning detail | Sprint state/membership guards, metadata, acceptance criteria, priorities, estimates, labels and filters | Sprint lifecycle, completed history, priority selection, pagination, rollback and cross-project tests |
 | Live web monitoring | `src/web.rs`, `web/` and read-only snapshot methods | Real Chromium desktop/mobile tests: key login, filters, project switching, issue details, agents, activity, live CLI updates, safe rendering, sign-out and revocation |
 | Assigned agent API keys | Schema-2 hashed key registry, authenticated HTTP commands, keyed CLI/MCP | Tests check actor binding, hashed storage, metadata-only listing, individual revocation, inactive agents, rejected impersonation and blocked remote key administration; SDK validates live MCP revocation |
+| Safe retries | `Store::execute_idempotent`, the CLI flag, HTTP header and MCP argument | `tests/push.rs`: replay returns the stored result once; same key with a different command conflicts; actors are isolated; failures, reads and administration are not recorded; keys expire after a day; eight racing threads apply one command |
+| Live event stream | `src/web.rs` `stream`, `Store::events_after` | Raw-socket SSE tests: replay, `Last-Event-ID` resume, live delivery of writes from another process and over HTTP, project scoping, lease-token redaction, rejection of bad keys/projects, termination on key revocation and on shutdown; real Chromium confirms the dashboard opens the stream and updates in about a second |
+| Webhook delivery | `src/webhooks.rs`, webhook commands in `src/store.rs` | A local receiver verifies ordered delivery, no replay of history, HMAC signatures against an independent reference value, lease-token removal, action filters that keep the cursor moving, retry of the same event after a 500, pause after 25 failures, and secrets and URLs never appearing in listings or the log |
 | Tested and validated delivery | Tests, locked SDK validator, build/lint checks and packaged skill | Commands above; installation smoke test; Git commits and remote branch equality at delivery |
 
 The official SDK validator authenticates with an assigned agent key, negotiates the protocol, validates the advertised JSON
@@ -49,8 +52,8 @@ The suite checks rollback of both state and audit events, and refuses unknown
 future database versions.
 
 Operating boundaries are explicit in the README: trusted cooperating agents,
-key-required HTTP access, local SQLite storage, direct blocking semantics and no
-automatic mutation deduplication. Unkeyed CLI/MCP remains a trusted local operator
+key-required HTTP access, local SQLite storage, direct blocking semantics and mutation
+deduplication only for requests that carry an idempotency key. Unkeyed CLI/MCP remains a trusted local operator
 interface, while keyed sessions derive agent identity and cannot administer keys. A GitHub Actions workflow supplies the same build, lint,
 test, SDK and Chromium checks; remote runner execution depends on the hosting service.
 

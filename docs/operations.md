@@ -152,8 +152,9 @@ Domain codes: `invalid` (fields/ranges), `not_found` (missing entity), `conflict
 (revision, workflow, lease, duplicate or lifecycle guard), `internal` (storage/JSON
 failure). CLI parse errors use `invalid`; CLI input I/O errors use `io`. Inspect the
 message for context. Rejected mutations roll back entirely. Reads return a
-transactionally consistent snapshot. Commands do not offer request idempotency;
-inspect state/history after a transport failure before retrying mutations.
+transactionally consistent snapshot. A mutation sent with an
+idempotency key (see below) is safe to retry after a transport failure; without
+one, inspect state/history before retrying.
 
 MCP tool domain errors use `isError: true`, not JSON-RPC errors. Invalid JSON-RPC,
 unknown methods and malformed RPC parameters use protocol errors. Notifications
@@ -180,7 +181,8 @@ API mutations. Local DB/CLI/MCP operator access remains trusted by OS permission
 | `GET /api/issues/AG-1` | Issue, links, blockers, children, recent comments and history |
 | `GET /api/issues/AG-1/events?before=123` | Newest-first issue history page |
 | `GET /api/issues/AG-1/comments?before=123` | Newest-first comments page |
-| `POST /api/commands` | Any non-key-management command JSON; executes as the key's agent |
+| `GET /api/events/stream?project=AG&after=123` | Server-sent event stream; see [Event stream](#event-stream) |
+| `POST /api/commands` | Any command except key and webhook administration; executes as the key's agent. Accepts an `Idempotency-Key` header |
 
 Observer pages contain `items` and `next_before` (null at the end), 100 items per
 page. `before` is exclusive. These backward cursors are separate from the command
@@ -195,13 +197,84 @@ Domain errors return `{"error":{"code":"...","message":"..."}}`: invalid fields
 400, not found 404, conflicts 409, internal errors 500. Malformed command JSON is
 rejected by the JSON extractor (400/422 depending on syntax/type). The HTTP JSON
 body limit is 2 MiB. Unsupported methods return 405. Authentication failures are
-401, and remote key management returns 403. No CORS access is enabled.
+401, and remote key or webhook management returns 403. No CORS access is enabled.
 
 All responses are `Cache-Control: no-store`, with a restrictive Content Security
 Policy, `nosniff` and no referrer forwarding. The UI renders issue/comment text as
 text, never HTML, including metadata and event snapshots. API keys live in the
 browser tab's session storage, never URLs. They are removed on sign-out or 401.
 Use HTTPS when making the service accessible beyond localhost.
+
+### Idempotency
+
+`Store::execute_idempotent` runs a command at most once per `(actor, key)`. The key
+is the `--idempotency-key` CLI flag, the `Idempotency-Key` HTTP header, or the
+`idempotency_key` MCP argument; it is 1-128 characters from `A-Za-z0-9_.:-`.
+
+| Situation | Result |
+| --- | --- |
+| First use of a key | The command runs; its result is stored in the same transaction |
+| Same key, same command | The stored result is returned and marked replayed; nothing runs |
+| Same key, different command | `conflict` |
+| Command failed | Nothing is stored, so the key can be retried |
+| Read-only command | Key ignored |
+| Key or webhook administration | `invalid`; results contain secrets and are never stored |
+| Key older than 24 hours | Forgotten; the command runs again |
+
+Replays are marked `"replayed":true` in CLI and MCP (`structuredContent`) output and
+by an `Idempotent-Replayed: true` HTTP header. The comparison uses the parsed command,
+so whitespace and field order do not matter. A replay returns the original result
+verbatim, including a claim's lease token and expiry, which may since have passed.
+The record is stored in the schema-3 `idempotency` table and pruned as new keys arrive.
+
+### Event stream
+
+`GET /api/events/stream` (any authenticated agent) is a `text/event-stream`:
+
+| Query / header | Effect |
+| --- | --- |
+| none | Only events created after the connection opens |
+| `after=N` | Events with id above `N`; `after=0` replays the log |
+| `Last-Event-ID: N` | Same as `after`, takes precedence; sent automatically by reconnecting clients |
+| `project=AG` | Project issue, sprint and project events plus global agent events |
+
+Messages carry `id` (the event id), `event` (the action) and `data` (the event JSON,
+with lease tokens removed). A `keepalive` comment is sent every 15 seconds. In-process
+writes wake the stream immediately; writes by other processes (the CLI, MCP) are
+found by polling the log once per second. The key is re-checked on each cycle, so
+revoking it or deactivating the agent ends the stream; a reconnect then returns 401.
+An unknown `project` returns 404 and a negative `after` returns 400. Streams end when
+the server shuts down. Each open stream holds no database lock between checks.
+
+### Webhooks
+
+| Command (local operator only) | Required fields | Result |
+| --- | --- | --- |
+| `webhook_create` | `url`, `label`; optional `project`, `actions` | `webhook` and one-time `secret` |
+| `webhook_list` | None | Webhooks with delivery health; URLs are shown as `scheme://host/…` |
+| `webhook_set_active` | `id`, `active` | Pauses or resumes; resuming clears the failure count |
+| `webhook_delete` | `id` | Removes it |
+
+`url` must be an absolute `http` or `https` URL of at most 2048 bytes; at most 50
+webhooks may exist. `actions` lists event actions (empty means all). A webhook stores a
+`cursor` (the last event handled), `failures`, `last_error` and `last_delivered_at`,
+and sees only events after its creation. Delivery runs inside `workboard web`:
+
+- One `POST` per event with `Content-Type: application/json`, a 10-second timeout and
+  no redirects. The body is `{id, action, issue, actor, created_at, data}`.
+- Headers `X-Workboard-Event`, `X-Workboard-Event-Id`, `X-Workboard-Webhook`,
+  `X-Workboard-Timestamp` and `X-Workboard-Signature: sha256=<hex>`, the HMAC-SHA256 of
+  `"<timestamp>.<body>"` keyed with the secret. Reject signatures that do not match
+  and timestamps outside your tolerance.
+- Events go out in order. Any 2xx advances the cursor; any other outcome retries the
+  same event after 2, 4, 8 … seconds, capped at 15 minutes. A failing webhook never
+  delays the others. Delivery is at-least-once; deduplicate on `X-Workboard-Event-Id`.
+- The 25th consecutive failure pauses the webhook and records `webhook_disabled`.
+- `last_error` holds a short reason such as `endpoint returned HTTP 500` and never the URL.
+- Lease tokens are removed from payloads. The `webhook_created` event omits the URL so
+  that activity feeds, visible to every agent, cannot expose credentials embedded in it.
+
+The signing secret is kept in the `webhooks` table because it is needed to sign.
 
 ### Assigned API keys
 
@@ -214,7 +287,7 @@ Use HTTPS when making the service accessible beyond localhost.
 Use an unkeyed local CLI/MCP operator session with a registered active actor to
 administer keys. Key-authenticated HTTP, CLI and MCP sessions cannot issue, list
 or revoke keys. Keys contain 244 random bits from two UUID v4 values; only their
-SHA-256 digest is stored in the schema-2 `api_keys` table. Secrets are not recorded
+SHA-256 digest is stored in the `api_keys` table. Secrets are not recorded
 in events. Key metadata includes id, agent, label, created_at and revoked_at.
 Deactivate an agent to disable all its keys without deleting history; reactivation
 restores its unrevoked keys. For permanent removal, revoke each key.

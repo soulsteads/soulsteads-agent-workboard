@@ -11,13 +11,31 @@ pub fn command_schema() -> Value {
     schema["type"] = json!("object");
     schema
 }
+/// The tool accepts the command object plus an optional `idempotency_key`. Every
+/// command variant rejects unknown fields, so the key is added to each of them.
+fn tool_schema() -> Value {
+    let mut schema = command_schema();
+    let key = json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.:-]+$","description":"Optional. Retrying a mutation with the same key and arguments returns the original result with replayed:true instead of applying it twice. Reusing a key for a different command is a conflict. Keys last 24 hours and are scoped to the acting agent."});
+    if let Some(variants) = schema.get_mut("oneOf").and_then(Value::as_array_mut) {
+        for variant in variants {
+            if let Some(properties) = variant.get_mut("properties").and_then(Value::as_object_mut) {
+                properties.insert("idempotency_key".into(), key.clone());
+            }
+        }
+    }
+    schema
+}
 fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
 }
-fn tool_result(result: Result<Value, crate::Error>) -> Value {
+fn tool_result(result: Result<(Value, bool), crate::Error>) -> Value {
     match result {
-        Ok(value) => {
-            json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":{"result":value},"isError":false})
+        Ok((value, replayed)) => {
+            let mut structured = json!({"result":value});
+            if replayed {
+                structured["replayed"] = json!(true);
+            }
+            json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":structured,"isError":false})
         }
         Err(error) => {
             json!({"content":[{"type":"text","text":error.json().to_string()}],"structuredContent":{"error":error.json()},"isError":true})
@@ -110,24 +128,39 @@ impl Server {
             "ping" => json!({}),
             _ if !self.initialized => return Some(rpc_error(id, -32002, "initialize first")),
             "tools/list" => {
-                json!({"tools":[{"name":"workboard_execute","description":"Manage agent projects, epics, stories, tasks, bugs, subtasks, spikes, dependencies, assignments, state transitions, atomic leased claims, comments, events, boards and sprints. All mutations are attributed to the server's configured actor. Issue edits require expected_revision. Inspect the op alternatives in this schema.","inputSchema":command_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}}]})
+                json!({"tools":[{"name":"workboard_execute","description":"Manage agent projects, epics, stories, tasks, bugs, subtasks, spikes, dependencies, assignments, state transitions, atomic leased claims, comments, events, boards and sprints. All mutations are attributed to the server's configured actor. Issue edits require expected_revision. Inspect the op alternatives in this schema.","inputSchema":tool_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}}]})
             }
             "tools/call" => {
                 if params.get("name").and_then(Value::as_str) != Some("workboard_execute") {
                     return Some(rpc_error(id, -32602, "unknown tool"));
                 }
-                match serde_json::from_value::<Command>(
-                    params.get("arguments").cloned().unwrap_or(json!({})),
-                ) {
+                let mut arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+                let idempotency_key = match arguments
+                    .as_object_mut()
+                    .and_then(|o| o.remove("idempotency_key"))
+                {
+                    None => None,
+                    Some(Value::String(key)) => Some(key),
+                    Some(_) => {
+                        return Some(json!({"jsonrpc":"2.0","id":id,"result":tool_result(Err(
+                            crate::Error::Invalid("idempotency_key must be a string".into()),
+                        ))}));
+                    }
+                };
+                match serde_json::from_value::<Command>(arguments) {
                     Ok(command) => {
-                        if self.api_key.is_some() && command.is_key_management() {
+                        if self.api_key.is_some() && command.is_operator_only() {
                             return Some(rpc_error(
                                 id,
                                 -32001,
-                                "key administration requires local operator mode",
+                                "key and webhook administration requires local operator mode",
                             ));
                         }
-                        tool_result(self.store.execute(&self.actor, command))
+                        tool_result(self.store.execute_idempotent(
+                            &self.actor,
+                            idempotency_key.as_deref(),
+                            command,
+                        ))
                     }
                     Err(error) => tool_result(Err(crate::Error::Invalid(error.to_string()))),
                 }

@@ -143,6 +143,45 @@ pub struct Sprint {
     pub state: SprintState,
 }
 
+/// A push subscription. The signing secret is stored apart from this document and
+/// is returned exactly once, when the webhook is created.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Webhook {
+    pub id: String,
+    pub label: String,
+    pub url: String,
+    pub project: Option<String>,
+    /// Event actions to deliver; empty means every action.
+    pub actions: Vec<String>,
+    pub active: bool,
+    /// Id of the last event already handled; delivery resumes after it.
+    pub cursor: i64,
+    pub failures: u32,
+    pub last_error: Option<String>,
+    pub last_delivered_at: Option<i64>,
+    pub created_at: i64,
+}
+
+/// Leases are displayed by expiry, never by their worker fencing credential.
+pub fn redact_leases(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            if let Some(Value::Object(lease)) = object.get_mut("lease") {
+                lease.remove("token");
+            }
+            for child in object.values_mut() {
+                redact_leases(child);
+            }
+        }
+        Value::Array(array) => {
+            for child in array {
+                redact_leases(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct IssueFilter {
@@ -335,13 +374,41 @@ pub enum Command {
         state: SprintState,
     },
     Workflow {},
+    /// Operator only. Subscribe a URL to board events; the signing secret is shown once.
+    WebhookCreate {
+        url: String,
+        label: String,
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        actions: Vec<String>,
+    },
+    /// Operator only. List webhooks with delivery health; never secrets or full URLs.
+    WebhookList {},
+    /// Operator only. Pause or resume a webhook; resuming clears its failure count.
+    WebhookSetActive {
+        id: String,
+        active: bool,
+    },
+    /// Operator only. Permanently remove a webhook.
+    WebhookDelete {
+        id: String,
+    },
 }
 
 impl Command {
-    pub fn is_key_management(&self) -> bool {
+    /// Administration that handles secrets or outbound integrations. It is limited
+    /// to trusted local operator sessions and never offered to key-authenticated agents.
+    pub fn is_operator_only(&self) -> bool {
         matches!(
             self,
-            Self::ApiKeyCreate { .. } | Self::ApiKeyList { .. } | Self::ApiKeyRevoke { .. }
+            Self::ApiKeyCreate { .. }
+                | Self::ApiKeyList { .. }
+                | Self::ApiKeyRevoke { .. }
+                | Self::WebhookCreate { .. }
+                | Self::WebhookList {}
+                | Self::WebhookSetActive { .. }
+                | Self::WebhookDelete { .. }
         )
     }
 }

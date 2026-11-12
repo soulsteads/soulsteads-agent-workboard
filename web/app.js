@@ -36,6 +36,11 @@ let view = ["board", "agents", "activity"].includes(params.get("view"))
 let snapshot = null;
 let signature = "";
 let refreshing = false;
+let lastRefresh = 0;
+let streamLive = false;
+let streamToken = "";
+let streamAbort = null;
+let wakeTimer = 0;
 let detailKey = null;
 let detail = null;
 let detailVersion = 0;
@@ -190,6 +195,7 @@ async function api(path, key = token) {
   return response.json();
 }
 function authPrompt(message = "") {
+  stopStream();
   token = "";
   sessionStorage.removeItem("workboard-key");
   snapshot = null;
@@ -259,9 +265,78 @@ function updateSelectors() {
     (a) => a.active,
   ).length;
 }
+// Live updates: the server pushes one event per change, and each burst of events
+// triggers a single refresh. A fetch stream is used because EventSource cannot
+// send the Authorization header. Polling continues as a slower safety net, and is
+// the only path if the stream is unavailable.
+function wake() {
+  clearTimeout(wakeTimer);
+  wakeTimer = setTimeout(() => {
+    if (!document.hidden) refresh();
+  }, 150);
+}
+function stopStream() {
+  streamAbort?.abort();
+  streamAbort = null;
+  streamToken = "";
+  streamLive = false;
+  clearTimeout(wakeTimer);
+}
+async function followEvents() {
+  if (!token || streamToken === token) return;
+  stopStream();
+  const mine = token;
+  const controller = new AbortController();
+  streamAbort = controller;
+  streamToken = mine;
+  let delay = 1000;
+  try {
+    while (!controller.signal.aborted && token === mine) {
+      try {
+        const response = await fetch("/api/events/stream", {
+          headers: { Authorization: `Bearer ${mine}` },
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        // Refresh handles invalid keys, which returns the user to sign-in.
+        if (response.status === 401 || response.status === 403) return;
+        if (!response.ok || !response.body) throw new Error("stream unavailable");
+        streamLive = true;
+        delay = 1000;
+        wake(); // Cover anything that changed while disconnected.
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let end;
+          while ((end = buffer.indexOf("\n\n")) >= 0) {
+            const block = buffer.slice(0, end);
+            buffer = buffer.slice(end + 2);
+            if (/^id:/m.test(block)) wake();
+          }
+        }
+      } catch {
+        if (controller.signal.aborted) return;
+      }
+      streamLive = false;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay = Math.min(delay * 2, 30000);
+    }
+  } finally {
+    if (streamAbort === controller) {
+      streamAbort = null;
+      streamToken = "";
+      streamLive = false;
+    }
+  }
+}
 async function refresh() {
   if (!token || refreshing) return;
   refreshing = true;
+  lastRefresh = Date.now();
   $("#refresh").disabled = true;
   const requestedProject = selectedProject;
   const requestedToken = token;
@@ -282,6 +357,7 @@ async function refresh() {
         ).values(),
       ];
     snapshot = data;
+    followEvents();
     $("#error").hidden = true;
     connection(true, "Live");
     $("#updated").textContent =
@@ -1139,8 +1215,9 @@ $("#issue-dialog").addEventListener("close", () => {
   updateUrl();
 });
 setInterval(() => {
-  if (!document.hidden) refresh();
-}, 3000);
+  const every = streamLive ? 15000 : 3000;
+  if (!document.hidden && Date.now() - lastRefresh >= every) refresh();
+}, 1000);
 setInterval(updateLeases, 1000);
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) refresh();
