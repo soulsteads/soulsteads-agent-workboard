@@ -25,6 +25,7 @@ seconds; agents remain in control of execution. Click a screenshot for full size
 | Clear dependencies | Parent hierarchies and blocking links with cycle checks, plus related-issue and duplicate links. |
 | One owner per claim | Atomic selection, expiring leases, heartbeats, and tokens that reject stale workers. |
 | Safe concurrent edits | Required issue revisions prevent agents from silently overwriting one another. |
+| Find anything | Full-text search over titles, descriptions, labels, criteria and comments, ranked by relevance, with filters and saved searches. |
 | Safe retries | An optional idempotency key makes a retried mutation return its original result instead of applying twice. |
 | Push, don't poll | A server-sent event stream and signed webhooks deliver every change as it happens, with lease tokens always removed. |
 | A useful handoff | Comments, artifact references in metadata, and an immutable audit trail attributed to each agent. |
@@ -145,7 +146,7 @@ same database. Replace the paths and key in your MCP client configuration:
 ```
 
 Call `workboard_execute` with the command object directly, for example
-`{"op":"board","project":"AG"}`. The tool's schema describes all 32 operations;
+`{"op":"board","project":"AG"}`. The tool's schema describes all 36 operations;
 key and webhook administration are available only in local operator sessions.
 
 MCP also provides issue and board resources, registry and workflow resources, and
@@ -210,6 +211,46 @@ are coordinated explicitly; workers claim their children.
 
 See the [command and workflow reference](docs/operations.md) for the full
 transition map, filters, pagination, sprint rules, and error codes.
+
+## Find work
+
+`issue_search` finds issues by what they say and by their fields, best match first.
+Give it a `query`, or the name of a `saved` search:
+
+```bash
+workboard run '{"op":"issue_search","query":"lease timeout state:ready -flaky"}'
+```
+
+| Query | Meaning |
+| --- | --- |
+| `lease timeout` | Every word must match: title, description, labels, criteria, key or any comment. Words are stemmed, so `claims` finds `claiming`. |
+| `"lease timeout"` | An exact phrase. |
+| `sched*` | Any word starting with `sched`. |
+| `retry OR backoff` | Either word (`OR` in capitals). |
+| `-flaky` `-"known issue"` | Exclude matches; needs at least one word to search for. |
+| `AG-12` | An issue key. |
+| `state:ready` `kind:bug` `priority:high` | Structured filters, combined with AND. Values are those of the JSON API; `in-progress` is accepted for `in_progress`. |
+| `project:AG` `sprint:ID` `parent:AG-1` `label:rust` | More filters. Quote a value with spaces: `label:"needs review"`. |
+| `assignee:forge` `assignee:none` | Owned by an agent, or unassigned. |
+| `is:actionable` | Ready to start: ready, not an epic, unblocked, and with an open parent if it has one. |
+
+Each result has the `issue`, a `score` (higher is better), and a `snippet` with the
+matched words in `[brackets]`. A match in the title outranks one in the description,
+which outranks one in a comment. Results page with `offset` and `limit`, and report
+`total` and `next_offset` as `issue_list` does. A mistake is reported, not ignored: an
+unknown filter such as `statee:ready` is an error that lists the valid ones, and
+`"error:timeout"` in quotes searches for that text. User text is never passed to the
+search engine as syntax, so punctuation cannot cause errors.
+
+Save a search for every agent to reuse. Only its owner can replace or delete it:
+
+```bash
+workboard run '{"op":"filter_save","name":"ready-bugs","query":"kind:bug state:ready is:actionable"}'
+workboard run '{"op":"issue_search","saved":"ready-bugs"}'
+```
+
+`filter_list` shows them, and `filter_delete` removes one. The query is validated
+when saved, so a saved search can always be run.
 
 ## Safe retries
 
@@ -315,8 +356,9 @@ restores unrevoked keys. Key-authenticated sessions cannot administer keys.
   retained for local operators who already have direct database access.
 - **One host owns the database:** keep SQLite WAL on local storage. Remote
   agents use HTTP; do not share database files over a network filesystem.
-- **Durable history:** schema version 3 is initialized automatically and versions 1
-  and 2 migrate in place. Back up a live board with SQLite's online backup API or
+- **Durable history:** schema version 4 is initialized automatically and versions 1
+  to 3 migrate in place, indexing existing issues and comments. A binary that
+  predates a schema will refuse a database migrated past it. Back up a live board with SQLite's online backup API or
   `.backup`; stop writers before copying database/WAL files directly.
 - **Reconcile uncertain outcomes:** mutations are deduplicated only when you send
   an [idempotency key](#safe-retries). Without one, inspect state and events before
@@ -325,8 +367,11 @@ restores unrevoked keys. Key-authenticated sessions cannot administer keys.
 
 Commands run transactionally with a 10-second busy timeout. Failed commands leave
 no partial state or audit events. Cancellation and agent deactivation preserve
-history. Board views currently evaluate stored documents in memory, targeting
-coordination boards that fit on one host.
+history. Lists, boards, claims, search and the dashboard snapshot run on indexes, so their cost
+follows the size of the answer rather than the whole database; the checks that keep
+the dependency graph acyclic likewise visit only the issues connected to a change.
+At 20,000 issues a board loads in about 5 ms and creating an issue takes under 2 ms.
+The design still targets one host.
 
 ## Development and validation
 

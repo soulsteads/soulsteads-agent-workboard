@@ -49,7 +49,11 @@ apply directly, not through ancestor inheritance.
 Use `issue_assign` to reserve work for an active agent, or null to unassign.
 Assignment is a coordinator override that revokes a lease, so do not use it
 merely to refresh your own claim. Use labels, priorities and sprints to organize
-work. `issue_list` supports a filter for project/kind/state/assignee/parent/sprint/
+work. To find an issue by what it says, use `issue_search` with a query such as
+`lease timeout state:ready -flaky` (words, "phrases", prefix*, OR, -exclusions, and
+`state:` `kind:` `priority:` `assignee:` `label:` `is:actionable` filters); it ranks the best
+match first and returns a snippet. `filter_save` keeps a search under a name for others.
+`issue_list` supports a filter for project/kind/state/assignee/parent/sprint/
 label/text/actionable and offset/limit. `epic_progress` counts all descendants.
 
 ## Execute safely
