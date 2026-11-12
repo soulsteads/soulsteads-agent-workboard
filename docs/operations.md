@@ -123,7 +123,11 @@ defaults to 100 and must be 1–1000. Empty results mean no further data current
 
 | Operation | Required fields besides `op` | Optional fields / result |
 | --- | --- | --- |
-| `issue_list` | — | `filter`; returns `items`, `total`, `next_offset` |
+| `issue_list` | — | `filter` (project, kind, state, priority, assignee, unassigned, parent, sprint, label, text, actionable, offset, limit); returns `items`, `total`, `next_offset` |
+| `issue_search` | `query` or `saved` | `offset`, `limit`; ranked `items` of `{issue, score, snippet}`, `total`, `next_offset`, and the effective `query` |
+| `filter_save` | `name`, `query` | Saves or replaces a shared search; owner only |
+| `filter_list` | — | Saved searches with owner, query and timestamps |
+| `filter_delete` | `name` | Removes a saved search; owner only |
 | `board` | `project` | `sprint`; all state columns, total and actionable issue keys |
 | `epic_progress` | `key` | Epic plus all descendants, total, done, canceled, open |
 | `sprint_create` | `project`, `name` | `goal`; returns sprint with UUID id |
@@ -225,7 +229,70 @@ Replays are marked `"replayed":true` in CLI and MCP (`structuredContent`) output
 by an `Idempotent-Replayed: true` HTTP header. The comparison uses the parsed command,
 so whitespace and field order do not matter. A replay returns the original result
 verbatim, including a claim's lease token and expiry, which may since have passed.
-The record is stored in the schema-3 `idempotency` table and pruned as new keys arrive.
+The record is stored in the `idempotency` table and pruned as new keys arrive.
+
+## Search and indexes
+
+`issue_search` accepts the query language below. `issue_list` keeps its structured
+filter, including the substring `text` match, and now also accepts `priority`.
+
+| Query | Meaning |
+| --- | --- |
+| `a b` | All words (implicit AND), matched in key, title, description, labels, acceptance criteria and comments |
+| `"a b"` | Phrase |
+| `a*` | Prefix |
+| `a OR b` | Alternatives; OR binds looser than the implicit AND, so `a b OR c` is `(a b) OR c` |
+| `-a`, `-"a b"` | Exclusion. Needs a positive word; cannot be combined with OR |
+| `project:` `kind:` `state:` `priority:` `assignee:` `label:` `sprint:` `parent:` | At most one of each. `assignee:none` means unassigned |
+| `is:actionable`, `is:unassigned` | Ready, unblocked, non-epic work whose parent (if any) is open; no assignee |
+
+Names and enum values are case-insensitive. Limits: 1,000 bytes, 32 terms, no control
+characters. Errors are `invalid` with a message that names the problem. Every term is
+quoted before it reaches SQLite FTS5, so `AG-12`, `NEAR(`, `AND`, `col:x` and quotes are
+text, never operators. Text uses the `porter unicode61` tokenizer: case-insensitive,
+accent-folding and stemmed. Ranking is BM25 with weights key 10, title 10, labels 5,
+description 3, criteria 2, comments 1; the score returned is its negation so that higher
+is better. Ties fall back to board order.
+
+**Board order** is priority (critical first), then creation time, then the number in the
+key, with creation order breaking any remaining tie.
+
+### How it is stored
+
+Issues remain JSON documents and the source of truth. Everything used to find them is
+derived, so it cannot disagree with them:
+
+- **Generated columns** on `issues` expose `project`, `kind`, `state`, `priority`,
+  `assignee`, `parent`, `sprint`, `lease_expires` and the sort keys `prio_rank`,
+  `created` and `seq`. SQLite computes them from the document; they need no upkeep.
+  Indexes cover the board (`project, state`, in board order), `assignee`, `parent`,
+  `sprint` and expiring leases, plus `links(target, kind)` for blockers.
+- **`issue_fts`** is an FTS5 table with one row per issue, holding its text and all its
+  comments. **`issue_labels`** maps labels to issues. Triggers maintain both, including when
+  a comment is added; saving an issue without changing its text or labels (a heartbeat,
+  a transition) does not touch them.
+- **`saved_filters`** holds saved searches.
+
+Opening a version 1-3 database migrates it in one transaction and indexes what is
+already there. The migration is idempotent and re-checks the version under the write
+lock, so processes that open an old database simultaneously are safe. A previous
+binary will refuse the migrated file.
+
+Structured filters resolve through these indexes, and a paged `issue_list` or
+`issue_search` reads only its page. Two checks run in code and therefore read every
+candidate that matches the rest of the filter: the substring `text` filter, and
+`actionable` (blockers and parents). A label-only filter uses its own table, and a
+search starting from a very common word and a narrow filter reads the matches of the
+word first.
+
+### Dependency checks
+
+A write that adds a parent or a `blocks` link is rejected as a completion cycle if the
+new edge's head can already reach its tail, found by walking outward from that edge.
+Only issues connected to the change are read, in place of the whole board. This relies
+on every stored graph being acyclic, which every accepted write guarantees; a database
+edited by hand to contain a cycle is not repaired, and the cycle is no longer reported on
+unrelated writes.
 
 ### Event stream
 

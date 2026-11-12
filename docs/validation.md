@@ -12,8 +12,8 @@ uv run --locked scripts/validate_mcp.py target/release/workboard
 uv run --locked scripts/validate_web.py target/release/workboard --install-browser
 ```
 
-Validated on Linux with Rust/Cargo 1.99.1. The Rust suite has 38 integration tests
-(10 domain, 4 interface/process, 7 web/authentication, and 17 push tests) plus 2 unit tests. Development dependencies for the
+Validated on Linux with Rust/Cargo 1.99.1. The Rust suite has 56 integration tests
+(10 domain, 4 interface/process, 7 web/authentication, 17 push, 15 search, and 3 cycle tests) plus 13 unit tests. Development dependencies for the
 SDK validator are pinned in `scripts/validate_mcp.py.lock` and `scripts/validate_web.py.lock`; Rust dependencies are
 pinned in `Cargo.lock`. The command engine, HTTP server, CLI and MCP are Rust; the embedded dashboard
 uses plain JavaScript and CSS. Python is used only for independent SDK and
@@ -36,6 +36,11 @@ browser integration validation.
 | Safe retries | `Store::execute_idempotent`, the CLI flag, HTTP header and MCP argument | `tests/push.rs`: replay returns the stored result once; same key with a different command conflicts; actors are isolated; failures, reads and administration are not recorded; keys expire after a day; eight racing threads apply one command |
 | Live event stream | `src/web.rs` `stream`, `Store::events_after` | Raw-socket SSE tests: replay, `Last-Event-ID` resume, live delivery of writes from another process and over HTTP, project scoping, lease-token redaction, rejection of bad keys/projects, termination on key revocation and on shutdown; real Chromium confirms the dashboard opens the stream and updates in about a second |
 | Webhook delivery | `src/webhooks.rs`, webhook commands in `src/store.rs` | A local receiver verifies ordered delivery, no replay of history, HMAC signatures against an independent reference value, lease-token removal, action filters that keep the cursor moving, retry of the same event after a 500, pause after 25 failures, and secrets and URLs never appearing in listings or the log |
+| Indexed queries | Generated columns, indexes and `select_issues` in `src/store.rs`, schema in `src/schema.rs` | `tests/search.rs` compares `issue_list` with an independent port of the original filter-and-sort over 400 random filter/page combinations on a 260-issue board with timestamp ties and key-number boundaries; `EXPLAIN QUERY PLAN` shows each filter uses its index and the board order needs no sort |
+| Full-text search | `src/query.rs`, `issue_fts` and its triggers | Words, phrases, prefixes, stemming, OR and exclusion; comments, labels and criteria searchable and kept current across edits; ranking and highlighted snippets; paging; 48 hostile queries (stray quotes and brackets, operators, NUL bytes, emoji, oversize input) never produce a storage error; parser unit tests |
+| Saved filters | `filter_*` commands | Shared, validated on save, owner-only changes, audited, retry-safe |
+| Migration | `src/schema.rs` | A hand-built version 3 database and one created by the actual previous release are migrated with their comments searchable; eight simultaneous openers index each issue exactly once; reopening changes nothing; the old binary refuses the result |
+| Fast dependency checks | `completion_graph` / `reaches` in `src/store.rs` | `tests/cycles.rs` runs random histories of parent changes and blocking links and requires the same accept/reject decision as the original whole-board algorithm (also run against the original code to confirm the oracle); 21 writes on a 6,000-issue board are bounded |
 | Tested and validated delivery | Tests, locked SDK validator, build/lint checks and packaged skill | Commands above; installation smoke test; Git commits and remote branch equality at delivery |
 
 The official SDK validator authenticates with an assigned agent key, negotiates the protocol, validates the advertised JSON
@@ -64,6 +69,10 @@ key, then browser login, navigation, issue context, key failure, live updates fr
 a separate CLI process, literal rendering of hostile issue text, phone-width
 layout without page overflow, sign-out and revocation. Screenshots can be saved
 with `--screenshots /tmp/workboard-qa` and are also produced by CI.
+
+`cargo test --release --test scale -- --ignored --nocapture` times the read paths and
+`issue_create` on a 20,000-issue board, printing milliseconds. It is not part of CI because
+timings vary by machine; `SCALE_SEARCH=1` adds search.
 
 `tests/web.rs` exercises authenticated HTTP commands, duplicate-claim protection,
 recursive lease-secret redaction, monitoring without mutations, 205-entry cursor

@@ -182,12 +182,13 @@ pub fn redact_leases(value: &mut Value) {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct IssueFilter {
     pub project: Option<String>,
     pub kind: Option<IssueKind>,
     pub state: Option<State>,
+    pub priority: Option<Priority>,
     pub assignee: Option<String>,
     pub unassigned: bool,
     pub parent: Option<String>,
@@ -374,6 +375,31 @@ pub enum Command {
         state: SprintState,
     },
     Workflow {},
+    /// Full-text search with filters, best match first. Give `query` or the name of a
+    /// `saved` filter. Words must all match (title, description, labels, acceptance
+    /// criteria, key or comments); "quoted phrases", prefix*, a OR b and -excluded work,
+    /// as do state:, kind:, priority:, project:, assignee:, label:, sprint:, parent:,
+    /// is:actionable and is:unassigned. Each hit carries a score and a [highlighted] snippet.
+    IssueSearch {
+        #[serde(default)]
+        query: Option<String>,
+        #[serde(default)]
+        saved: Option<String>,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Save a search under a name for every agent to reuse with `issue_search`. Only
+    /// its owner can replace or delete it. The query is validated when saved.
+    FilterSave {
+        name: String,
+        query: String,
+    },
+    FilterList {},
+    FilterDelete {
+        name: String,
+    },
     /// Operator only. Subscribe a URL to board events; the signing secret is shown once.
     WebhookCreate {
         url: String,

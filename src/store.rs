@@ -234,32 +234,11 @@ pub struct Store {
 }
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 3 {
-            return Err(invalid("database schema is newer than this binary"));
-        }
-        conn.execute_batch("BEGIN IMMEDIATE;
-            CREATE TABLE IF NOT EXISTS agents(id TEXT PRIMARY KEY, doc TEXT NOT NULL CHECK(json_valid(doc)));
-            CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY, doc TEXT NOT NULL CHECK(json_valid(doc)));
-            CREATE TABLE IF NOT EXISTS issues(id TEXT PRIMARY KEY, doc TEXT NOT NULL CHECK(json_valid(doc)));
-            CREATE TABLE IF NOT EXISTS sprints(id TEXT PRIMARY KEY, doc TEXT NOT NULL CHECK(json_valid(doc)));
-            CREATE TABLE IF NOT EXISTS counters(project TEXT PRIMARY KEY REFERENCES projects(id), value INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS links(source TEXT REFERENCES issues(id),target TEXT REFERENCES issues(id),kind TEXT NOT NULL,PRIMARY KEY(source,target,kind),CHECK(source<>target));
-            CREATE TABLE IF NOT EXISTS comments(id INTEGER PRIMARY KEY AUTOINCREMENT,issue TEXT NOT NULL REFERENCES issues(id),actor TEXT NOT NULL REFERENCES agents(id),body TEXT NOT NULL,created_at INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT,issue TEXT,actor TEXT NOT NULL,action TEXT NOT NULL,data TEXT NOT NULL,created_at INTEGER NOT NULL);
-            CREATE INDEX IF NOT EXISTS comments_issue ON comments(issue,id);
-            CREATE INDEX IF NOT EXISTS events_issue ON events(issue,id);
-            CREATE INDEX IF NOT EXISTS issues_project ON issues(json_extract(doc,'$.project'));
-            CREATE TABLE IF NOT EXISTS api_keys(id TEXT PRIMARY KEY,agent TEXT NOT NULL REFERENCES agents(id),label TEXT NOT NULL,key_hash TEXT NOT NULL UNIQUE,created_at INTEGER NOT NULL,revoked_at INTEGER);
-            CREATE TABLE IF NOT EXISTS idempotency(actor TEXT NOT NULL,key TEXT NOT NULL,request_hash TEXT NOT NULL,response TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(actor,key));
-            CREATE INDEX IF NOT EXISTS idempotency_created ON idempotency(created_at);
-            CREATE TABLE IF NOT EXISTS webhooks(id TEXT PRIMARY KEY,doc TEXT NOT NULL CHECK(json_valid(doc)),secret TEXT NOT NULL);
-            PRAGMA user_version=3;
-            COMMIT;")?;
+        crate::schema::migrate(&mut conn)?;
         Ok(Self { conn })
     }
     /// HTTP identity comes exclusively from a live key and active registry entry.
@@ -295,10 +274,14 @@ impl Store {
         if let Some(key) = &selected {
             let _: Project = get(&tx, "projects", key)?;
         }
-        let issues: Vec<_> = all::<Issue>(&tx, "issues")?
-            .into_iter()
-            .filter(|i| Some(&i.project) == selected.as_ref())
-            .collect();
+        let issues = match &selected {
+            Some(project) => query_issues(
+                &tx,
+                "SELECT doc FROM issues WHERE project=?1 ORDER BY rowid",
+                [project],
+            )?,
+            None => vec![],
+        };
         let sprints: Vec<_> = all::<Sprint>(&tx, "sprints")?
             .into_iter()
             .filter(|s| Some(&s.project) == selected.as_ref())
@@ -405,6 +388,27 @@ impl Store {
         tx.commit()?;
         Ok((result, false))
     }
+    /// The SQLite plan for the query a filter (and optional search text) runs, so that
+    /// tests can prove the indexes are used instead of trusting timing.
+    #[doc(hidden)]
+    pub fn explain_issue_query(
+        &self,
+        filter: &IssueFilter,
+        search: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let fts = match search {
+            Some(text) => parse_query(text)?.fts,
+            None => None,
+        };
+        let Some((select, _, values)) = issue_query(filter, fts.as_deref()) else {
+            return Ok(vec![]);
+        };
+        let mut stmt = self.conn.prepare(&format!("EXPLAIN QUERY PLAN {select}"))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(&values), |r| {
+            r.get::<_, String>(3)
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
     /// Validates a stream scope and picks its starting point: an explicit cursor, or
     /// the newest event so that a fresh stream carries only what happens next.
     pub fn stream_cursor(&self, project: Option<&str>, after: Option<i64>) -> Result<i64> {
@@ -509,6 +513,12 @@ impl Store {
     }
 }
 
+/// Issues from a query that selects only `doc`.
+fn query_issues(tx: &Connection, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Issue>> {
+    let mut stmt = tx.prepare_cached(sql)?;
+    let rows = stmt.query_map(params, |r| r.get::<_, String>(0))?;
+    rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
+}
 fn links(tx: &Connection) -> Result<Vec<Link>> {
     let mut s = tx.prepare("SELECT source,target,kind FROM links ORDER BY source,target,kind")?;
     let rows = s.query_map([], |r| {
@@ -529,79 +539,85 @@ fn links(tx: &Connection) -> Result<Vec<Link>> {
     .collect()
 }
 fn blockers(tx: &Connection, key: &str) -> Result<Vec<String>> {
-    let mut blocked = vec![];
-    for link in links(tx)? {
-        if link.kind == LinkKind::Blocks && link.target == key {
-            let source: Issue = get(tx, "issues", &link.source)?;
-            if !source.state.terminal() {
-                blocked.push(source.key);
-            }
-        }
-    }
-    Ok(blocked)
+    let mut stmt = tx.prepare_cached(
+        "SELECT i.id FROM links l JOIN issues i ON i.id=l.source
+         WHERE l.target=?1 AND l.kind=?2 AND i.state NOT IN ('done','canceled')
+         ORDER BY l.source",
+    )?;
+    let rows = stmt.query_map(params![key, encode(&LinkKind::Blocks)?], |r| r.get(0))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
+/// Every issue below `key` in the hierarchy, in creation order.
 fn descendants(tx: &Connection, key: &str) -> Result<Vec<Issue>> {
-    let issues = all::<Issue>(tx, "issues")?;
-    let mut found = HashSet::from([key.to_owned()]);
-    loop {
-        let before = found.len();
-        for issue in &issues {
-            if issue.parent.as_ref().is_some_and(|p| found.contains(p)) {
-                found.insert(issue.key.clone());
-            }
-        }
-        if before == found.len() {
-            break;
-        }
-    }
-    Ok(issues
-        .into_iter()
-        .filter(|i| i.key != key && found.contains(&i.key))
-        .collect())
+    query_issues(
+        tx,
+        "WITH RECURSIVE below(id) AS (
+            SELECT id FROM issues WHERE parent=?1
+            UNION SELECT i.id FROM issues i JOIN below b ON i.parent=b.id)
+         SELECT doc FROM issues WHERE id IN (SELECT id FROM below) AND id<>?1 ORDER BY rowid",
+        [key],
+    )
 }
 
-// Completion depends both on explicit blockers and on finishing children. Checking
-// only explicit link cycles would miss an epic blocking its own descendant.
+// Completion depends both on explicit blockers and on finishing children, so an
+// epic that blocks its own child can never finish even though no single link or
+// parent chain loops. The edges, each pointing at what must finish later, are
+// "child -> parent" and "blocker -> blocked".
+//
+// Every accepted write leaves this graph acyclic, so a new cycle must run through
+// the one edge being added. Asking whether that edge's head can reach its tail
+// visits only the issues connected to it, instead of every issue on the board.
 fn completion_graph(
     tx: &Connection,
     replacement: Option<&Issue>,
     added: Option<&Link>,
 ) -> Result<()> {
-    let mut issues = all::<Issue>(tx, "issues")?;
-    if let Some(issue) = replacement {
-        issues.retain(|i| i.key != issue.key);
-        issues.push(issue.clone());
+    let mut new_edges = vec![];
+    if let Some(issue) = replacement
+        && let Some(parent) = &issue.parent
+    {
+        new_edges.push((issue.key.as_str(), parent.as_str()));
     }
-    let mut edges: Vec<(String, String)> = issues
-        .iter()
-        .filter_map(|i| i.parent.as_ref().map(|p| (i.key.clone(), p.clone())))
-        .collect();
-    for l in links(tx)?.into_iter().chain(added.cloned()) {
-        if l.kind == LinkKind::Blocks {
-            edges.push((l.source, l.target));
-        }
+    if let Some(link) = added {
+        new_edges.push((link.source.as_str(), link.target.as_str()));
     }
-    let mut remaining: HashSet<_> = issues.into_iter().map(|i| i.key).collect();
-    while !remaining.is_empty() {
-        let roots: Vec<_> = remaining
-            .iter()
-            .filter(|key| {
-                !edges
-                    .iter()
-                    .any(|(source, target)| target == *key && remaining.contains(source))
-            })
-            .cloned()
-            .collect();
-        if roots.is_empty() {
+    for (from, to) in new_edges {
+        if reaches(tx, to, from)? {
             return Err(conflict(
                 "dependencies and parent hierarchy must not form a completion cycle",
             ));
         }
-        for root in roots {
-            remaining.remove(&root);
-        }
     }
     Ok(())
+}
+/// Whether `goal` can be reached from `start` along the stored completion edges.
+///
+/// A pending change to an issue's parent need not be consulted: the issue that is
+/// changing is always the `goal`, and the walk stops on reaching it.
+fn reaches(tx: &Connection, start: &str, goal: &str) -> Result<bool> {
+    let blocks = encode(&LinkKind::Blocks)?;
+    let mut stored_parent = tx.prepare_cached("SELECT parent FROM issues WHERE id=?1")?;
+    let mut blocked = tx.prepare_cached("SELECT target FROM links WHERE source=?1 AND kind=?2")?;
+    let mut seen = HashSet::new();
+    let mut pending = vec![start.to_owned()];
+    while let Some(node) = pending.pop() {
+        if node == goal {
+            return Ok(true);
+        }
+        if !seen.insert(node.clone()) {
+            continue;
+        }
+        let parent = stored_parent
+            .query_row([&node], |r| r.get::<_, Option<String>>(0))
+            .optional()?
+            .flatten();
+        pending.extend(parent);
+        let targets = blocked.query_map(params![node, blocks], |r| r.get::<_, String>(0))?;
+        for target in targets {
+            pending.push(target?);
+        }
+    }
+    Ok(false)
 }
 fn validate_issue(tx: &Connection, issue: &Issue) -> Result<()> {
     nonempty(&issue.title, "title")?;
@@ -674,58 +690,201 @@ fn actionable(tx: &Connection, i: &Issue) -> Result<bool> {
     }
     Ok(true)
 }
-fn filtered(tx: &Connection, f: &IssueFilter) -> Result<Vec<Issue>> {
-    let mut result = vec![];
-    for i in all::<Issue>(tx, "issues")? {
-        if f.project.as_ref().is_some_and(|v| v != &i.project)
-            || f.kind.is_some_and(|v| v != i.kind)
-            || f.state.is_some_and(|v| v != i.state)
-            || f.assignee
-                .as_ref()
-                .is_some_and(|v| Some(v) != i.assignee.as_ref())
-            || (f.unassigned && i.assignee.is_some())
-            || f.parent
-                .as_ref()
-                .is_some_and(|v| Some(v) != i.parent.as_ref())
-            || f.sprint
-                .as_ref()
-                .is_some_and(|v| Some(v) != i.sprint.as_ref())
-            || f.label.as_ref().is_some_and(|v| !i.labels.contains(v))
-        {
-            continue;
+/// A SQL `WHERE` clause over `issues AS i`, with its bound values.
+struct Clause {
+    sql: String,
+    values: Vec<rusqlite::types::Value>,
+}
+fn variant<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .expect("enum serializes to a string")
+}
+/// Translates the structured part of a filter to SQL over the generated columns.
+/// `None` means the filter contradicts itself and nothing can match.
+fn clause(f: &IssueFilter) -> Option<Clause> {
+    let mut sql = String::from("1");
+    let mut values = vec![];
+    let mut and = |text: &str, value: Option<String>| {
+        sql.push_str(" AND ");
+        sql.push_str(text);
+        if let Some(value) = value {
+            values.push(rusqlite::types::Value::Text(value));
         }
-        if let Some(t) = &f.text {
-            let t = t.to_lowercase();
+    };
+    // Only a ready issue can be actionable, so that is a filter the index can use.
+    let state = match (f.actionable, f.state) {
+        (true, Some(s)) if s != State::Ready => return None,
+        (true, _) => Some(State::Ready),
+        (false, s) => s,
+    };
+    if f.unassigned && f.assignee.is_some() {
+        return None;
+    }
+    if let Some(v) = &f.project {
+        and("i.project=?", Some(v.clone()));
+    }
+    if let Some(v) = f.kind {
+        and("i.kind=?", Some(variant(&v)));
+    }
+    if let Some(v) = state {
+        and("i.state=?", Some(variant(&v)));
+    }
+    if let Some(v) = f.priority {
+        and("i.priority=?", Some(variant(&v)));
+    }
+    if let Some(v) = &f.assignee {
+        and("i.assignee=?", Some(v.clone()));
+    }
+    if f.unassigned {
+        and("i.assignee IS NULL", None);
+    }
+    if let Some(v) = &f.parent {
+        and("i.parent=?", Some(v.clone()));
+    }
+    if let Some(v) = &f.sprint {
+        and("i.sprint=?", Some(v.clone()));
+    }
+    if let Some(v) = &f.label {
+        and(
+            "i.id IN (SELECT issue FROM issue_labels WHERE label=?)",
+            Some(v.clone()),
+        );
+    }
+    Some(Clause { sql, values })
+}
+/// Board order: priority, then age, then the number in the key; ties keep creation order.
+const BOARD_ORDER: &str = "i.prio_rank, i.created, i.seq, i.rowid";
+/// Relative weight of each indexed field, in column order: key, title, description,
+/// labels, criteria, comments. A match in the title counts most.
+const RANKING: &str = "bm25(issue_fts,10.0,10.0,3.0,5.0,2.0,1.0)";
+
+struct Hit {
+    issue: Issue,
+    score: Option<f64>,
+    snippet: Option<String>,
+}
+/// The SQL for a selection, so that it can be run and also have its plan inspected.
+fn issue_query(
+    f: &IssueFilter,
+    fts: Option<&str>,
+) -> Option<(String, String, Vec<rusqlite::types::Value>)> {
+    let Clause {
+        sql: filter,
+        mut values,
+    } = clause(f)?;
+    let (from, matching, order, extra) = match fts {
+        Some(expression) => {
+            values.insert(0, rusqlite::types::Value::Text(expression.to_owned()));
+            (
+                "issues i JOIN issue_fts ON issue_fts.rowid=i.rowid",
+                "issue_fts MATCH ?",
+                format!("score DESC, {BOARD_ORDER}"),
+                format!(", -{RANKING} AS score, snippet(issue_fts,-1,'[',']','…',14) AS snip"),
+            )
+        }
+        None => (
+            "issues i",
+            "1",
+            BOARD_ORDER.to_owned(),
+            ", NULL AS score, NULL AS snip".to_owned(),
+        ),
+    };
+    let where_ = format!("{matching} AND {filter}");
+    let select = format!("SELECT i.doc{extra} FROM {from} WHERE {where_} ORDER BY {order}");
+    let count = format!("SELECT COUNT(*) FROM {from} WHERE {where_}");
+    Some((select, count, values))
+}
+fn hits(tx: &Connection, sql: &str, values: &[rusqlite::types::Value]) -> Result<Vec<Hit>> {
+    let mut stmt = tx.prepare_cached(sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(values), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<f64>>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let mut found = vec![];
+    for row in rows {
+        let (doc, score, snippet) = row?;
+        found.push(Hit {
+            issue: serde_json::from_str(&doc)?,
+            score,
+            snippet,
+        });
+    }
+    Ok(found)
+}
+/// Matching issues, best first, and how many match in all.
+///
+/// Structured fields are resolved by SQL over indexes. Two checks cannot be: the
+/// legacy substring `text` filter, and whether blockers and parents allow an issue
+/// to be worked on. When either is requested every candidate is loaded to apply
+/// them; otherwise only the requested page is read.
+fn select_issues(
+    tx: &Connection,
+    f: &IssueFilter,
+    fts: Option<&str>,
+    page: Option<(usize, usize)>,
+) -> Result<(Vec<Hit>, usize)> {
+    let Some((select, count, values)) = issue_query(f, fts) else {
+        return Ok((vec![], 0));
+    };
+    let post_filtered = f.text.is_some() || f.actionable;
+    if !post_filtered {
+        let total: i64 = tx
+            .prepare_cached(&count)?
+            .query_row(rusqlite::params_from_iter(&values), |r| r.get(0))?;
+        let found = match page {
+            Some((offset, n)) => hits(tx, &format!("{select} LIMIT {n} OFFSET {offset}"), &values)?,
+            None => hits(tx, &select, &values)?,
+        };
+        return Ok((found, total as usize));
+    }
+    let needle = f.text.as_ref().map(|t| t.to_lowercase());
+    let mut found = vec![];
+    for hit in hits(tx, &select, &values)? {
+        if let Some(t) = &needle {
+            let i = &hit.issue;
             if !format!("{} {} {}", i.key, i.title, i.description)
                 .to_lowercase()
-                .contains(&t)
+                .contains(t)
             {
                 continue;
             }
         }
-        if f.actionable && !actionable(tx, &i)? {
+        if f.actionable && !actionable(tx, &hit.issue)? {
             continue;
         }
-        result.push(i);
+        found.push(hit);
     }
-    result.sort_by_key(|i| {
-        (
-            match i.priority {
-                Priority::Critical => 0,
-                Priority::High => 1,
-                Priority::Medium => 2,
-                Priority::Low => 3,
-            },
-            i.created_at,
-            i.key
-                .rsplit('-')
-                .next()
-                .and_then(|n| n.parse::<i64>().ok())
-                .unwrap_or(0),
-        )
-    });
-    Ok(result)
+    let total = found.len();
+    if let Some((offset, n)) = page {
+        found = found.into_iter().skip(offset).take(n).collect();
+    }
+    Ok((found, total))
 }
+fn filtered(tx: &Connection, f: &IssueFilter) -> Result<Vec<Issue>> {
+    Ok(select_issues(tx, f, None, None)?
+        .0
+        .into_iter()
+        .map(|h| h.issue)
+        .collect())
+}
+fn saved_query(tx: &Connection, name: &str) -> Result<String> {
+    tx.query_row(
+        "SELECT query FROM saved_filters WHERE name=?1",
+        [name],
+        |r| r.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| Error::NotFound(format!("saved filter {name}")))
+}
+fn parse_query(text: &str) -> Result<crate::query::Parsed> {
+    crate::query::parse(text).map_err(Error::Invalid)
+}
+
 fn read_only(c: &Command) -> bool {
     matches!(
         c,
@@ -741,6 +900,8 @@ fn read_only(c: &Command) -> bool {
             | Command::SprintList { .. }
             | Command::Workflow {}
             | Command::WebhookList {}
+            | Command::IssueSearch { .. }
+            | Command::FilterList {}
     )
 }
 
@@ -833,6 +994,95 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
             }
             event(tx, actor, None, "api_key_revoked", json!({"id":id}))?;
             Ok(json!({"id":id,"revoked":true}))
+        }
+        IssueSearch {
+            query,
+            saved,
+            offset,
+            limit: n,
+        } => {
+            let text = match (query, saved) {
+                (Some(q), None) => q,
+                (None, Some(name)) => saved_query(tx, &name)?,
+                _ => return Err(invalid("give exactly one of query or saved")),
+            };
+            let n = limit(n)?;
+            let parsed = parse_query(&text)?;
+            let (found, total) =
+                select_issues(tx, &parsed.filter, parsed.fts.as_deref(), Some((offset, n)))?;
+            let next = (offset.saturating_add(found.len()) < total).then(|| offset + found.len());
+            let items: Vec<_> = found
+                .into_iter()
+                .map(|h| json!({"issue":h.issue,"score":h.score,"snippet":h.snippet}))
+                .collect();
+            Ok(json!({"items":items,"total":total,"next_offset":next,"query":text}))
+        }
+        FilterSave { name, query } => {
+            identifier(&name)?;
+            nonempty(&query, "query")?;
+            parse_query(&query)?;
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT owner FROM saved_filters WHERE name=?1",
+                    [&name],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match existing {
+                Some(owner) if owner != actor => {
+                    return Err(conflict(format!("saved filter {name} belongs to {owner}")));
+                }
+                Some(_) => {
+                    tx.execute(
+                        "UPDATE saved_filters SET query=?2, updated_at=?3 WHERE name=?1",
+                        params![name, query, now()],
+                    )?;
+                }
+                None => {
+                    let count: i64 =
+                        tx.query_row("SELECT COUNT(*) FROM saved_filters", [], |r| r.get(0))?;
+                    if count >= 500 {
+                        return Err(conflict("at most 500 saved filters are allowed"));
+                    }
+                    tx.execute(
+                        "INSERT INTO saved_filters(name,owner,query,created_at,updated_at) VALUES(?1,?2,?3,?4,?4)",
+                        params![name, actor, query, now()],
+                    )?;
+                }
+            }
+            event(
+                tx,
+                actor,
+                None,
+                "filter_saved",
+                json!({"name":name,"query":query}),
+            )?;
+            Ok(json!({"name":name,"owner":actor,"query":query}))
+        }
+        FilterList {} => {
+            let mut stmt = tx.prepare(
+                "SELECT name,owner,query,created_at,updated_at FROM saved_filters ORDER BY name",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(json!({"name":r.get::<_,String>(0)?,"owner":r.get::<_,String>(1)?,"query":r.get::<_,String>(2)?,"created_at":r.get::<_,i64>(3)?,"updated_at":r.get::<_,i64>(4)?}))
+            })?;
+            Ok(json!(rows.collect::<std::result::Result<Vec<_>, _>>()?))
+        }
+        FilterDelete { name } => {
+            let owner: String = tx
+                .query_row(
+                    "SELECT owner FROM saved_filters WHERE name=?1",
+                    [&name],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::NotFound(format!("saved filter {name}")))?;
+            if owner != actor {
+                return Err(conflict(format!("saved filter {name} belongs to {owner}")));
+            }
+            tx.execute("DELETE FROM saved_filters WHERE name=?1", [&name])?;
+            event(tx, actor, None, "filter_deleted", json!({"name":name}))?;
+            Ok(json!({"name":name,"deleted":true}))
         }
         WebhookCreate {
             url,
@@ -1003,14 +1253,13 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
                 .filter(|l| l.source == key || l.target == key)
                 .collect();
             Ok(
-                json!({"issue":i,"links":l,"blockers":blockers(tx,&key)?,"children":all::<Issue>(tx,"issues")?.into_iter().filter(|i|i.parent.as_deref()==Some(&key)).collect::<Vec<_>>()}),
+                json!({"issue":i,"links":l,"blockers":blockers(tx,&key)?,"children":query_issues(tx,"SELECT doc FROM issues WHERE parent=?1 ORDER BY rowid",[&key])?}),
             )
         }
         IssueList { filter } => {
             let n = limit(filter.limit)?;
-            let items = filtered(tx, &filter)?;
-            let total = items.len();
-            let items: Vec<_> = items.into_iter().skip(filter.offset).take(n).collect();
+            let (hits, total) = select_issues(tx, &filter, None, Some((filter.offset, n)))?;
+            let items: Vec<_> = hits.into_iter().map(|h| h.issue).collect();
             let next = if filter.offset.saturating_add(items.len()) < total {
                 Some(filter.offset + items.len())
             } else {
@@ -1183,19 +1432,23 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
             let _: Project = get(tx, "projects", &project)?;
             let seconds = duration(lease_seconds)?;
             // Recovery, selection, assignment and lease issuance are a single write transaction.
-            for mut i in all::<Issue>(tx, "issues")? {
-                if i.project == project && i.lease.as_ref().is_some_and(|l| l.expires_at <= now()) {
-                    i.lease = None;
-                    i.assignee = None;
-                    i.state = State::Ready;
-                    save(tx, actor, &mut i, "claim_expired")?;
-                }
+            let expired = query_issues(
+                tx,
+                "SELECT doc FROM issues WHERE project=?1 AND lease_expires<=?2 ORDER BY rowid",
+                params![project, now()],
+            )?;
+            for mut i in expired {
+                i.lease = None;
+                i.assignee = None;
+                i.state = State::Ready;
+                save(tx, actor, &mut i, "claim_expired")?;
             }
             let mut selected = None;
             for i in filtered(
                 tx,
                 &IssueFilter {
                     project: Some(project),
+                    state: Some(State::Ready),
                     ..Default::default()
                 },
             )? {
@@ -1491,9 +1744,11 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
                 return Err(conflict("project already has an active sprint"));
             }
             if state == SprintState::Completed
-                && all::<Issue>(tx, "issues")?
-                    .iter()
-                    .any(|i| i.sprint.as_deref() == Some(&id) && !i.state.terminal())
+                && tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM issues WHERE sprint=?1 AND state NOT IN ('done','canceled'))",
+                    [&id],
+                    |r| r.get::<_, bool>(0),
+                )?
             {
                 return Err(conflict(
                     "finish work or move open issues out of sprint before completing",
@@ -1524,7 +1779,7 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
 
 // Events that belong to a project: its issues, plus project-level and agent events.
 // Parameter ?1 is the project key, or NULL for every event.
-const EVENT_SCOPE: &str = "(?1 IS NULL OR e.issue IN (SELECT id FROM issues WHERE json_extract(doc,'$.project')=?1)
+const EVENT_SCOPE: &str = "(?1 IS NULL OR e.issue IN (SELECT id FROM issues WHERE project=?1)
     OR (e.issue IS NULL AND (e.action LIKE 'agent_%' OR json_extract(e.data,'$.project')=?1 OR (e.action='project_created' AND json_extract(e.data,'$.key')=?1))))";
 
 // Oldest-first events after a cursor, for push streams and webhook delivery.
