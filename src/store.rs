@@ -442,6 +442,10 @@ impl Store {
         }
         Ok(targets)
     }
+    /// Whether the webhook still exists and is enabled for another request.
+    pub(crate) fn webhook_is_active(&self, id: &str) -> Result<bool> {
+        Ok(webhook_by_id(&self.conn, id)?.is_some_and(|webhook| webhook.active))
+    }
     /// The next events a webhook should receive, plus the id of the last event
     /// examined. Events the webhook filters out must still advance its cursor, or
     /// a run of unrelated events would stall delivery.

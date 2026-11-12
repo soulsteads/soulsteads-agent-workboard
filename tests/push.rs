@@ -755,6 +755,393 @@ fn webhook_state(b: &Board, id: &str) -> Value {
         .clone()
 }
 
+struct GatedReceiver {
+    url: String,
+    requests: tokio::sync::mpsc::UnboundedReceiver<Value>,
+    permits: Arc<tokio::sync::Semaphore>,
+    status: Arc<AtomicU16>,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    server: tokio::task::JoinHandle<()>,
+}
+impl GatedReceiver {
+    async fn new() -> Self {
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let (sender, requests) = tokio::sync::mpsc::unbounded_channel();
+        let status = Arc::new(AtomicU16::new(200));
+        let state = (sender, permits.clone(), status.clone());
+        async fn hook(
+            State((sender, permits, status)): State<(
+                tokio::sync::mpsc::UnboundedSender<Value>,
+                Arc<tokio::sync::Semaphore>,
+                Arc<AtomicU16>,
+            )>,
+            body: String,
+        ) -> StatusCode {
+            let _ = sender.send(serde_json::from_str(&body).unwrap());
+            if let Ok(permit) = permits.acquire().await {
+                permit.forget();
+            }
+            StatusCode::from_u16(status.load(Ordering::SeqCst)).unwrap()
+        }
+        let app = Router::new().route("/hook", post(hook)).with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        Self {
+            url,
+            requests,
+            permits,
+            status,
+            shutdown,
+            server,
+        }
+    }
+    async fn next(&mut self) -> Option<Value> {
+        tokio::time::timeout(Duration::from_secs(3), self.requests.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+    async fn stop(self) {
+        self.permits.close();
+        let _ = self.shutdown.send(());
+        self.server.await.unwrap();
+    }
+}
+
+fn gated_subscription(db: &webhooks::Database, receiver: &GatedReceiver) -> String {
+    run(
+        &mut db.lock().unwrap(),
+        "admin",
+        json!({"op":"webhook_create","url":receiver.url,"label":"gated","project":"PUSH","actions":["issue_created"]}),
+    )["webhook"]["id"].as_str().unwrap().to_owned()
+}
+
+fn queued_issues(db: &webhooks::Database, count: usize) -> Vec<i64> {
+    let mut store = db.lock().unwrap();
+    (0..count).map(|index| {
+        run(&mut store, "admin", json!({"op":"issue_create","project":"PUSH","kind":"task","title":format!("queued-{index}")}));
+        latest_event(&mut store)
+    }).collect()
+}
+
+async fn cursor_reaches(b: &Board, id: &str, cursor: i64) -> bool {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while webhook_state(b, id)["cursor"].as_i64().unwrap() < cursor {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+#[tokio::test]
+async fn dispatcher_regression_slow_receiver_does_not_block_healthy_next_event() {
+    let board = Board::new();
+    let db = Arc::new(Mutex::new(board.open()));
+    let hub = Hub::new();
+    let mut slow = GatedReceiver::new().await;
+    let mut healthy = GatedReceiver::new().await;
+    gated_subscription(&db, &slow);
+    let healthy_id = gated_subscription(&db, &healthy);
+    let first_id = queued_issues(&db, 1)[0];
+    let worker = tokio::spawn(webhooks::run(db.clone(), hub.subscribe()));
+    let slow_first = slow.next().await;
+    let healthy_first = healthy.next().await;
+    healthy.permits.add_permits(1);
+    let first_acked = cursor_reaches(&board, &healthy_id, first_id).await;
+    let second_id = queued_issues(&db, 1)[0];
+    hub.notify();
+    let healthy_second = healthy.next().await;
+    worker.abort();
+    let _ = worker.await;
+    slow.stop().await;
+    healthy.stop().await;
+    assert_eq!(
+        slow_first.map(|event| event["id"].clone()),
+        Some(json!(first_id))
+    );
+    assert_eq!(
+        healthy_first.map(|event| event["id"].clone()),
+        Some(json!(first_id))
+    );
+    assert!(first_acked, "healthy first event must be acknowledged");
+    assert_eq!(
+        healthy_second.map(|event| event["id"].clone()),
+        Some(json!(second_id)),
+        "healthy second event must arrive before releasing the slow response"
+    );
+}
+
+#[tokio::test]
+async fn dispatcher_regression_delete_stops_subsequent_batch_requests() {
+    let board = Board::new();
+    let db = Arc::new(Mutex::new(board.open()));
+    let hub = Hub::new();
+    let mut receiver = GatedReceiver::new().await;
+    let id = gated_subscription(&db, &receiver);
+    let events = queued_issues(&db, 3);
+    let worker = tokio::spawn(webhooks::run(db.clone(), hub.subscribe()));
+    let first = receiver.next().await;
+    run(
+        &mut db.lock().unwrap(),
+        "admin",
+        json!({"op":"webhook_delete","id":id}),
+    );
+    hub.notify();
+    receiver.permits.add_permits(1);
+    let subsequent = receiver.next().await;
+    worker.abort();
+    let _ = worker.await;
+    receiver.stop().await;
+    assert_eq!(
+        first.map(|event| event["id"].clone()),
+        Some(json!(events[0]))
+    );
+    assert!(
+        subsequent.is_none(),
+        "deleted webhook must not initiate requests 2/3: {subsequent:?}"
+    );
+}
+
+#[tokio::test]
+async fn dispatcher_regression_pause_stops_batch_and_resume_preserves_remaining_order() {
+    let board = Board::new();
+    let db = Arc::new(Mutex::new(board.open()));
+    let hub = Hub::new();
+    let mut receiver = GatedReceiver::new().await;
+    let id = gated_subscription(&db, &receiver);
+    let events = queued_issues(&db, 3);
+    let worker = tokio::spawn(webhooks::run(db.clone(), hub.subscribe()));
+    let first = receiver.next().await;
+    run(
+        &mut db.lock().unwrap(),
+        "admin",
+        json!({"op":"webhook_set_active","id":id,"active":false}),
+    );
+    hub.notify();
+    receiver.permits.add_permits(1);
+    let first_acked = cursor_reaches(&board, &id, events[0]).await;
+    let while_paused = receiver.next().await;
+    let paused_cursor = webhook_state(&board, &id)["cursor"].clone();
+    run(
+        &mut db.lock().unwrap(),
+        "admin",
+        json!({"op":"webhook_set_active","id":id,"active":true}),
+    );
+    hub.notify();
+    receiver.permits.add_permits(3);
+    let second = receiver.next().await;
+    let third = receiver.next().await;
+    let all_acked = cursor_reaches(&board, &id, events[2]).await;
+    let duplicate = receiver.next().await;
+    worker.abort();
+    let _ = worker.await;
+    receiver.stop().await;
+    assert_eq!(
+        first.map(|event| event["id"].clone()),
+        Some(json!(events[0]))
+    );
+    assert!(
+        first_acked,
+        "already-in-flight success must advance the paused cursor"
+    );
+    assert!(
+        while_paused.is_none(),
+        "paused webhook must not initiate requests 2/3: {while_paused:?}"
+    );
+    assert_eq!(paused_cursor, events[0]);
+    assert_eq!(
+        second.map(|event| event["id"].clone()),
+        Some(json!(events[1]))
+    );
+    assert_eq!(
+        third.map(|event| event["id"].clone()),
+        Some(json!(events[2]))
+    );
+    assert!(all_acked, "resume must acknowledge the remaining events");
+    assert!(
+        duplicate.is_none(),
+        "resume must not duplicate acknowledged events"
+    );
+}
+
+#[tokio::test]
+async fn dispatcher_regression_wakes_keep_one_batch_in_flight_and_drain_promptly() {
+    let board = Board::new();
+    let db = Arc::new(Mutex::new(board.open()));
+    let hub = Hub::new();
+    let mut receiver = GatedReceiver::new().await;
+    let id = gated_subscription(&db, &receiver);
+    let mut events = queued_issues(&db, 1);
+    let worker = tokio::spawn(webhooks::run(db.clone(), hub.subscribe()));
+    let first = receiver.next().await;
+    events.extend(queued_issues(&db, 30));
+    for _ in 0..10 {
+        hub.notify();
+        tokio::task::yield_now().await;
+    }
+    let overlapping =
+        tokio::time::timeout(Duration::from_millis(200), receiver.requests.recv()).await;
+    receiver.permits.add_permits(events.len());
+    let remaining = tokio::time::timeout(Duration::from_millis(700), async {
+        let mut received = Vec::new();
+        for _ in 1..events.len() {
+            received.push(
+                receiver.requests.recv().await.unwrap()["id"]
+                    .as_i64()
+                    .unwrap(),
+            );
+        }
+        received
+    })
+    .await;
+    let all_acked = cursor_reaches(&board, &id, *events.last().unwrap()).await;
+    worker.abort();
+    let _ = worker.await;
+    receiver.stop().await;
+    assert_eq!(
+        first.map(|event| event["id"].clone()),
+        Some(json!(events[0]))
+    );
+    assert!(
+        overlapping.is_err(),
+        "wakes must not start overlapping batches"
+    );
+    assert_eq!(
+        remaining.ok(),
+        Some(events[1..].to_vec()),
+        "pending batches must drain without waiting for the one-second idle poll"
+    );
+    assert!(all_acked);
+}
+
+#[tokio::test]
+async fn dispatcher_regression_wakes_preserve_independent_retry_backoff() {
+    let board = Board::new();
+    let db = Arc::new(Mutex::new(board.open()));
+    let hub = Hub::new();
+    let mut failing = GatedReceiver::new().await;
+    let mut healthy = GatedReceiver::new().await;
+    let failing_id = gated_subscription(&db, &failing);
+    let healthy_id = gated_subscription(&db, &healthy);
+    let first_id = queued_issues(&db, 1)[0];
+    failing.status.store(500, Ordering::SeqCst);
+    let worker = tokio::spawn(webhooks::run(db.clone(), hub.subscribe()));
+    let failed_first = failing.next().await;
+    let healthy_first = healthy.next().await;
+    failing.permits.add_permits(1);
+    healthy.permits.add_permits(1);
+    let recorded_failure = tokio::time::timeout(Duration::from_secs(3), async {
+        while webhook_state(&board, &failing_id)["failures"] != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    let healthy_acked = cursor_reaches(&board, &healthy_id, first_id).await;
+    let second_id = queued_issues(&db, 1)[0];
+    hub.notify();
+    let healthy_second =
+        tokio::time::timeout(Duration::from_millis(700), healthy.requests.recv()).await;
+    let early_retry =
+        tokio::time::timeout(Duration::from_millis(200), failing.requests.recv()).await;
+    let retry = failing.next().await;
+    failing.status.store(200, Ordering::SeqCst);
+    failing.permits.add_permits(2);
+    healthy.permits.add_permits(1);
+    let failing_second = failing.next().await;
+    let recovered = cursor_reaches(&board, &failing_id, second_id).await;
+    worker.abort();
+    let _ = worker.await;
+    failing.stop().await;
+    healthy.stop().await;
+    assert_eq!(
+        failed_first.map(|event| event["id"].clone()),
+        Some(json!(first_id))
+    );
+    assert_eq!(
+        healthy_first.map(|event| event["id"].clone()),
+        Some(json!(first_id))
+    );
+    assert!(recorded_failure && healthy_acked);
+    assert_eq!(
+        healthy_second
+            .ok()
+            .flatten()
+            .map(|event| event["id"].clone()),
+        Some(json!(second_id)),
+        "healthy wake must not wait for another subscription's backoff"
+    );
+    assert!(early_retry.is_err(), "wakes must not bypass retry backoff");
+    assert_eq!(
+        retry.map(|event| event["id"].clone()),
+        Some(json!(first_id))
+    );
+    assert_eq!(
+        failing_second.map(|event| event["id"].clone()),
+        Some(json!(second_id))
+    );
+    assert!(recovered, "retry must recover in order and clear failures");
+    assert_eq!(webhook_state(&board, &failing_id)["failures"], 0);
+}
+
+#[tokio::test]
+async fn dispatcher_regression_failure_recording_error_preserves_retry_backoff() {
+    let board = Board::new();
+    let db = Arc::new(Mutex::new(board.open()));
+    let hub = Hub::new();
+    let mut receiver = GatedReceiver::new().await;
+    let id = gated_subscription(&db, &receiver);
+    let event = queued_issues(&db, 1)[0];
+    // Reads still work, but recording a delivery failure must roll back.
+    board
+        .sql()
+        .execute_batch(
+            "CREATE TRIGGER reject_failure_recording BEFORE UPDATE ON webhooks
+         WHEN json_extract(NEW.doc,'$.failures') > json_extract(OLD.doc,'$.failures')
+         BEGIN SELECT RAISE(ABORT,'injected failure recording error'); END;",
+        )
+        .unwrap();
+    receiver.status.store(500, Ordering::SeqCst);
+    let worker = tokio::spawn(webhooks::run(db.clone(), hub.subscribe()));
+    let first = receiver.next().await;
+    receiver.permits.add_permits(1);
+    let early_retry =
+        tokio::time::timeout(Duration::from_millis(400), receiver.requests.recv()).await;
+    let delayed_retry = if early_retry.is_err() {
+        receiver.next().await
+    } else {
+        None
+    };
+    let stored_failures = webhook_state(&board, &id)["failures"].clone();
+    worker.abort();
+    let _ = worker.await;
+    receiver.stop().await;
+    assert_eq!(first.map(|event| event["id"].clone()), Some(json!(event)));
+    assert_eq!(
+        stored_failures, 0,
+        "injected failure must not persist a counter"
+    );
+    assert!(
+        early_retry.is_err(),
+        "failed persistence must not bypass retry backoff"
+    );
+    assert_eq!(
+        delayed_retry.map(|event| event["id"].clone()),
+        Some(json!(event)),
+        "failure to persist must still allow the delayed retry"
+    );
+}
+
 #[test]
 fn webhook_administration_validates_input_and_never_reveals_secrets() {
     let b = Board::new();

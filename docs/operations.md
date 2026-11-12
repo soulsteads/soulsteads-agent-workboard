@@ -268,7 +268,13 @@ and sees only events after its creation. Delivery runs inside `workboard web`:
   and timestamps outside your tolerance.
 - Events go out in order. Any 2xx advances the cursor; any other outcome retries the
   same event after 2, 4, 8 … seconds, capped at 15 minutes. A failing webhook never
-  delays the others. Delivery is at-least-once; deduplicate on `X-Workboard-Event-Id`.
+  delays the others: each subscription has at most one in-flight batch and its own
+  retry deadline. Pending batches continue immediately; idle subscriptions wait for
+  a write notification or the one-second cross-process poll. Delivery is at-least-once;
+  deduplicate on `X-Workboard-Event-Id`.
+- Pausing or deleting a webhook stops subsequent requests, including the rest of a
+  pending batch. One already-in-flight request may finish; a successful response is
+  still acknowledged. Resuming preserves the cursor and delivers the remaining events.
 - The 25th consecutive failure pauses the webhook and records `webhook_disabled`.
 - `last_error` holds a short reason such as `endpoint returned HTTP 500` and never the URL.
 - Lease tokens are removed from payloads. The `webhook_created` event omits the URL so
