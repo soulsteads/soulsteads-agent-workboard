@@ -72,9 +72,18 @@ label/text/actionable and offset/limit. `epic_progress` counts all descendants.
    `lease_token`. Use the revision returned by each mutation or fetch it again.
    Arrays/metadata updates replace values; nullable fields are removed with
    `clear_parent`, `clear_sprint`, `clear_estimate` rather than null.
-5. Add evidence or artifact references with `comment_add` (`key`, `body`).
-   Transition `in_progress -> in_review -> done` with revision/token. A done
-   transition clears the lease. Finish descendants before closing parents.
+5. Submit completed work with `issue_submit`: `key`, `expected_revision`, the
+   current `lease_token`, a `summary`, and 1–64 `evidence` objects containing
+   `reference` and `summary`. This records a snapshot and moves to `in_review`,
+   releasing the lease for handoff. Comments alone do not authorize closure.
+6. A different registered actor inspects the submission and calls `issue_review`
+   with `key`, `expected_revision`, `submission_id`, `approved`, and a substantive
+   `note`. The worker cannot approve its own submission. A rejected submission
+   must return to `in_progress` and be resubmitted after corrections.
+7. After approval, `issue_transition` to `done` with the latest revision and no
+   old lease token. Finish descendants before closing parents. Review records
+   capture a reviewer's attestation; `external_outcome_verified` remains false
+   because Workboard does not execute or verify the referenced external work.
 
 On a revision conflict, reread and reconcile before editing. On an expired or
 revoked lease, stop submitting that work: a fresh revision does not restore

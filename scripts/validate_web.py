@@ -37,6 +37,11 @@ def validate(binary, screenshots, chromium):
             return cli({"op": "issue_create", "project": "AG", "kind": kind, "title": title, **extra})
 
         def transition(issue, state):
+            if state in ("in_review", "done") and issue["state"] != "in_review":
+                issue = cli({"op":"issue_submit", "key":issue["key"], "expected_revision":issue["revision"], "summary":"Browser fixture result", "evidence":[{"reference":"test://browser/receipt", "summary":"Inspect fixture receipt"}]}, issue["assignee"])
+            if state == "in_review": return issue
+            if state == "done":
+                issue = cli({"op":"issue_review", "key":issue["key"], "expected_revision":issue["revision"], "submission_id":issue["submission"]["id"], "approved":True, "note":"Separate reviewer checked browser fixture"})
             return cli({"op": "issue_transition", "key": issue["key"], "expected_revision": issue["revision"], "state": state})
 
         cli({"op": "agent_register", "id": "coordinator", "name": "Coordinator", "capabilities": ["planning", "triage"]})
@@ -65,7 +70,7 @@ def validate(binary, screenshots, chromium):
         create("spike", "Explore agent capability-based routing", assignee="atlas", labels=["research"])
         injection = create("bug", "<img src=x onerror=alert('xss')>", description="<script>alert('unsafe')</script>")
         cli({"op": "link_add", "source": ready["key"], "target": bug["key"], "kind": "blocks"})
-        process = subprocess.Popen([str(binary), "--db", str(database), "web", "--listen", "127.0.0.1:0"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        process = subprocess.Popen([str(binary), "--db", str(database), "web", "--listen", os.environ.get("WORKBOARD_TEST_LISTEN", "127.0.0.1:0")], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         lines = queue.Queue()
         def read_lines():
             for line in process.stderr:
@@ -111,6 +116,15 @@ def validate(binary, screenshots, chromium):
                     page.screenshot(path=str(Path(screenshots) / "issue-detail.png"), full_page=True)
                 page.get_by_role("button", name="Close issue details").click()
                 page.get_by_role("button", name="Clear filters").click()
+                page.get_by_role("button", name=f"{done['key']}: {done['title']}", exact=True).click()
+                expect(page.locator("#detail-content")).to_contain_text("Submitted evidence")
+                expect(page.locator("#detail-content")).to_contain_text("Independent review")
+                expect(page.locator("#detail-content")).to_contain_text("does not verify external outcomes")
+                page.get_by_text("Submitted issue snapshot", exact=True).click()
+                expect(page.locator("#detail-content")).to_contain_text(done["title"])
+                if screenshots:
+                    page.screenshot(path=str(Path(screenshots) / "evidence-review.png"), full_page=True)
+                page.keyboard.press("Escape")
                 page.get_by_label("Filter by agent").select_option("atlas")
                 expect(page.locator(".issue-card")).to_have_count(2)
                 page.get_by_role("button", name="Clear filters").click()

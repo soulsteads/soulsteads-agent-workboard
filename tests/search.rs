@@ -1173,6 +1173,9 @@ fn the_tool_schema_advertises_search_and_filters() {
         json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}),
     );
     let schema = ask(&mut server, 2, "tools/list", json!({}))["tools"][0]["inputSchema"].clone();
+    assert!(schema["properties"]["op"].is_object());
+    assert!(schema["properties"]["evidence"].is_object());
+    assert_eq!(schema["required"], json!(["op"]));
     let ops: Vec<String> = schema["oneOf"]
         .as_array()
         .unwrap()
@@ -1184,10 +1187,12 @@ fn the_tool_schema_advertises_search_and_filters() {
         "filter_save",
         "filter_list",
         "filter_delete",
+        "issue_submit",
+        "issue_review",
     ] {
         assert!(ops.contains(&op.to_owned()), "{op} missing from {ops:?}");
     }
-    assert_eq!(ops.len(), 36);
+    assert_eq!(ops.len(), 38);
     let reply = ask(
         &mut server,
         3,

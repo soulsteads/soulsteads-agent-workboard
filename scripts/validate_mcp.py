@@ -20,15 +20,16 @@ from mcp.client.stdio import stdio_client
 
 
 async def validate(binary: Path, database: Path):
-    def cli(command):
+    def cli(command, actor="worker"):
         result = subprocess.run(
-            [str(binary), "--db", str(database), "--actor", "worker", "run"],
+            [str(binary), "--db", str(database), "--actor", actor, "run"],
             input=json.dumps(command), text=True, capture_output=True, check=True,
         )
         assert not result.stderr, result.stderr
         return json.loads(result.stdout)["result"]
 
     cli({"op": "agent_register", "id": "worker", "name": "SDK worker"})
+    cli({"op": "agent_register", "id": "reviewer", "name": "Independent SDK reviewer"})
     cli({"op": "project_create", "key": "SDK", "name": "SDK validation"})
     credential = cli({"op": "api_key_create", "agent": "worker", "label": "Disposable SDK key"})
     parameters = StdioServerParameters(
@@ -54,26 +55,36 @@ async def validate(binary: Path, database: Path):
                 assert response.structuredContent["result"] == value
                 return value
 
+            async def finish(issue, token=None):
+                if issue.get("assignee") is None:
+                    issue = await call("issue_assign", key=issue["key"], expected_revision=issue["revision"], assignee="worker")
+                if issue["state"] == "ready":
+                    issue = await call("issue_transition", key=issue["key"], expected_revision=issue["revision"], state="in_progress")
+                issue = await call("issue_submit", key=issue["key"], expected_revision=issue["revision"], lease_token=token, summary="SDK result", evidence=[{"reference":"test://sdk/receipt", "summary":"Official SDK round trip"}])
+                issue = cli({"op":"issue_review", "key":issue["key"], "expected_revision":issue["revision"], "submission_id":issue["submission"]["id"], "approved":True, "note":"Independent SDK receipt review"}, "reviewer")
+                return await call("issue_transition", key=issue["key"], expected_revision=issue["revision"], state="done")
+
             epic = await call("issue_create", project="SDK", kind="epic", title="Ship agents")
             story = await call("issue_create", project="SDK", kind="story", title="SDK work loop", parent=epic["key"], acceptance_criteria=["Official SDK round trip passes"])
             bug = await call("issue_create", project="SDK", kind="bug", title="Dependency first", assignee="worker", parent=epic["key"])
             await call("link_add", source=bug["key"], target=story["key"], kind="blocks")
             await call("issue_transition", key=story["key"], expected_revision=1, state="ready")
             assert (await call("issue_claim", project="SDK"))["claimed"] is None
-            for state in ["ready", "in_progress", "done"]:
+            for state in ["ready", "in_progress"]:
                 bug = await call("issue_transition", key=bug["key"], expected_revision=bug["revision"], state=state)
+            bug = await finish(bug)
             claim = (await call("issue_claim", project="SDK", lease_seconds=60))["claimed"]
             assert claim["key"] == story["key"]
             token = claim["lease"]["token"]
             story = await call("issue_heartbeat", key=story["key"], lease_token=token, lease_seconds=900)
             story = await call("issue_update", key=story["key"], expected_revision=story["revision"], lease_token=token, labels=["validated"], metadata={"client": "official MCP Python SDK"})
             await call("comment_add", key=story["key"], body="Validated through official MCP SDK; schema, dependency, lease, revision and persistence checks passed.")
-            for state in ["in_review", "done"]:
-                story = await call("issue_transition", key=story["key"], expected_revision=story["revision"], lease_token=token, state=state)
+            story = await finish(story, token)
             assert story["lease"] is None
             assert (await call("epic_progress", key=epic["key"]))["open"] == 0
-            for state in ["ready", "in_progress", "done"]:
+            for state in ["ready", "in_progress"]:
                 epic = await call("issue_transition", key=epic["key"], expected_revision=epic["revision"], state=state)
+            epic = await finish(epic)
             for uri in ["workboard://workflow", "workboard://projects", "workboard://agents", f"workboard://issues/{story['key']}", "workboard://projects/SDK/board"]:
                 resource = await session.read_resource(uri)
                 assert json.loads(resource.contents[0].text)

@@ -50,6 +50,8 @@ assignee, timestamps and revisions cannot be changed through this operation.
 | --- | --- | --- |
 | `workflow` | — | States and permitted transitions |
 | `issue_transition` | `key`, `expected_revision`, `state` | `lease_token`; returns issue |
+| `issue_submit` | `key`, `expected_revision`, `summary`, `evidence` | `lease_token`; snapshots work, releases lease, enters review |
+| `issue_review` | `key`, `expected_revision`, `submission_id`, `approved`, `note` | Separate registered reviewer; returns issue |
 | `issue_claim` | `project` | `key`, `lease_seconds`; returns `{ "claimed": issue or null }` |
 | `issue_heartbeat` | `key`, `lease_token` | `lease_seconds`; returns issue |
 | `issue_release` | `key`, `lease_token` | Returns ready, unassigned issue |
@@ -58,14 +60,15 @@ assignee, timestamps and revisions cannot be changed through this operation.
 | --- | --- |
 | `backlog` | `ready`, `canceled` |
 | `ready` | `backlog`, `in_progress`, `blocked`, `canceled` |
-| `in_progress` | `ready`, `blocked`, `in_review`, `done`, `canceled` |
+| `in_progress` | `ready`, `blocked`, `canceled`; `issue_submit` enters `in_review` |
 | `blocked` | `ready`, `in_progress`, `backlog`, `canceled` |
 | `in_review` | `in_progress`, `blocked`, `done`, `canceled` |
 | `done`, `canceled` | `backlog` |
 
 New issues start in backlog. `done` and `canceled` are terminal. Starting, reviewing
 or completing non-epic work requires an active assignee and no unresolved direct
-blockers. Epics need no assignee. Terminal transitions require all descendants
+blockers. Epics may start without an assignee, but evidence submission requires an
+assigned worker for every kind, including epics. Terminal transitions require all descendants
 terminal. Reopen ancestors first. Move dependent issues out of `in_progress`,
 `in_review` or `done` before reopening their blocker. Move issues out of completed
 sprints before reopening them. These guards prevent impossible board states.
@@ -84,14 +87,17 @@ A claim lasts 900 seconds by default; `lease_seconds` accepts 1–86400. Only th
 owning actor with the current unexpired token can heartbeat, release, edit or
 transition a leased issue. Include `lease_token` alongside revisions for edits and
 transitions. Heartbeat extends expiry from the current time. Tokens survive
-in-review and in-progress; other transitions clear them. Release clears assignment
+in-progress work; evidence submission releases the token on entry to review.
+Other transitions clear them. Release clears assignment
 and returns work to ready. Expiry is recovered by the next project claim and emits
 `claim_expired`, then a new claim gets a new token. An expired worker cannot renew
 or submit, even if it reads the latest revision.
 
 Explicit `issue_assign` is a coordinator override: it revokes a lease and returns
 interrupted work to ready. Changing an unleased in-progress or in-review
-assignment also returns that work to ready. Retired workers cannot mutate or receive new assignments.
+assignment also returns that work to ready. Reassigning work awaiting review,
+even to the same worker, invalidates the submission and returns it to ready.
+Retired workers cannot mutate or receive new assignments.
 Their history remains readable/editable by active agents. An unleased issue can
 be managed with revisions alone; use claims for worker execution.
 
@@ -372,3 +378,28 @@ on every RPC request, including resource reads. MCP rejection of an invalid or
 revoked key uses protocol error -32001. Without a key these local interfaces
 retain trusted operator semantics. Agents on other hosts use the HTTP API rather
 than sharing SQLite files over a network filesystem.
+
+## Evidence-backed closure
+
+`issue_submit` requires the assigned worker, an unexpired claim token when leased,
+a summary, and 1–64 evidence objects (`reference`, `summary`). It records the
+worker identity, submitted issue snapshot and revision, then releases the lease.
+`issue_review` requires a different active registered actor and the exact current
+submission ID/revision. An approval authorizes `done`; direct completion without
+submission or review is rejected. A rejected review must return to `in_progress`
+and be replaced by a new submission. Nonterminal content edits and reassignments
+invalidate previous submissions and reviews. Reopening clears their active
+pointers, retaining every old receipt in the event history. Edits to terminal
+issue descriptions preserve the original submitted snapshot and review; they do
+not silently change what was reviewed.
+
+Evidence references are operator-selected identifiers, not URLs Workboard fetches.
+The reviewer must inspect them with its own tools and scope. The stored
+`external_outcome_verified: false` explicitly distinguishes a review record from
+verification of an external action. No external credentials or execution rights
+are granted by a board state.
+
+Existing `done` records remain historical after upgrade; missing submission/review
+fields deserialize as absent. They are not retroactively represented as reviewed.
+New closures require the gate. Back up the stopped SQLite database before upgrading;
+restore the backup with the previous binary if rollback is necessary.

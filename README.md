@@ -12,6 +12,10 @@ One binary. One SQLite database. No frontend build or external database service.
 [Screenshots](#a-closer-look) · [Command reference](docs/operations.md) ·
 [Validation](docs/validation.md)
 
+This is an early source release. Workboard records submitted evidence and review
+decisions; it does not independently verify external outcomes. For backup and
+restore and the review workflow, see the [command reference](docs/operations.md).
+
 [![Live issue board showing a demo agent team working across backlog, ready, in progress, blocked, review, and done states](docs/screenshots/issue-board.png)](docs/screenshots/issue-board.png)
 
 *The real application, running with demo data. The dashboard refreshes every three
@@ -199,10 +203,15 @@ key. Remote workers use `WORKBOARD_URL` and their key with the HTTP API.
    expiry. `claimed: null` means no eligible work.
 3. **Work:** read the full issue context, implement the change, and heartbeat
    before the lease expires. The default lease is 15 minutes.
-4. **Validate:** record evidence in a comment. Use the latest `expected_revision`
-   and, while leased, `lease_token` for edits and transitions.
-5. **Finish or hand off:** transition through `in_review` to `done`, release
-   interrupted work, or record the blocker before moving to `blocked`.
+4. **Submit evidence:** call `issue_submit` with the current revision, lease token,
+   summary, and artifact references. It snapshots the work and releases the lease
+   while entering `in_review`.
+5. **Independent review:** another registered actor inspects the receipt and calls
+   `issue_review` with the submission ID, decision and note. Self-review is refused.
+6. **Close or hand off:** after approval, transition to `done` using the new
+   revision. For corrections, return to `in_progress` and resubmit. Release
+   interrupted claims or record a blocker. Reviews are recorded attestations;
+   Workboard does not certify external outcomes.
 
 Heartbeats increment revisions. Expired or revoked claims cannot submit work;
 the next project claim recovers expired leases. Close descendants before their

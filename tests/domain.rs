@@ -34,8 +34,17 @@ impl Fixture {
         self.run(json!({"op":"issue_get","key":key}))["issue"].clone()
     }
     fn state(&mut self, key: &str, state: &str) -> Value {
-        let rev = self.issue(key)["revision"].clone();
-        self.run(json!({"op":"issue_transition","key":key,"expected_revision":rev,"state":state}))
+        let mut issue = self.issue(key);
+        if (state == "in_review" || state == "done") && issue["state"] != "in_review" {
+            issue = self.run(json!({"op":"issue_submit","key":key,"expected_revision":issue["revision"],"lease_token":issue["lease"]["token"],"summary":"Fixture work completed","evidence":[{"reference":"test://domain/work","summary":"Domain fixture result"}]}));
+        }
+        if state == "in_review" {
+            return issue;
+        }
+        if state == "done" {
+            issue = self.as_actor("b", json!({"op":"issue_review","key":key,"expected_revision":issue["revision"],"submission_id":issue["submission"]["id"],"approved":true,"note":"Independent fixture review"})).unwrap();
+        }
+        self.run(json!({"op":"issue_transition","key":key,"expected_revision":issue["revision"],"state":state}))
     }
 }
 
@@ -175,7 +184,7 @@ fn dependencies_cycles_links_and_claim_selection() {
     let claim = f.run(json!({"op":"issue_claim","project":"AG"}))["claimed"].clone();
     assert_eq!(claim["key"], "AG-1");
     assert!(f.run(json!({"op":"issue_claim","project":"AG"}))["claimed"].is_null());
-    f.run(json!({"op":"issue_transition","key":"AG-1","expected_revision":claim["revision"],"state":"done","lease_token":claim["lease"]["token"]}));
+    f.state("AG-1", "done");
     assert_eq!(
         f.run(json!({"op":"issue_claim","project":"AG"}))["claimed"]["key"],
         "AG-2"
@@ -350,14 +359,19 @@ fn completed_sprint_history_can_be_edited_but_not_reopened_in_place() {
     f.run(json!({"op":"sprint_transition","id":sprint["id"],"state":"active"}));
     f.run(json!({"op":"sprint_transition","id":sprint["id"],"state":"completed"}));
     // Historical records remain editable even when the assigned worker is retired.
-    f.run(json!({"op":"issue_assign","key":"AG-1","expected_revision":5,"assignee":"b"}));
+    let revision = f.issue("AG-1")["revision"].clone();
+    f.run(json!({"op":"issue_assign","key":"AG-1","expected_revision":revision,"assignee":"b"}));
     f.run(json!({"op":"agent_set_active","id":"b","active":false}));
-    f.run(json!({"op":"issue_update","key":"AG-1","expected_revision":6,"description":"retrospective"}));
+    let revision = f.issue("AG-1")["revision"].clone();
+    f.run(json!({"op":"issue_update","key":"AG-1","expected_revision":revision,"description":"retrospective"}));
+    let revision = f.issue("AG-1")["revision"].clone();
     f.err(
-        json!({"op":"issue_transition","key":"AG-1","expected_revision":7,"state":"backlog"}),
+        json!({"op":"issue_transition","key":"AG-1","expected_revision":revision,"state":"backlog"}),
         "conflict",
     );
-    f.run(json!({"op":"issue_update","key":"AG-1","expected_revision":7,"clear_sprint":true}));
+    f.run(
+        json!({"op":"issue_update","key":"AG-1","expected_revision":revision,"clear_sprint":true}),
+    );
     f.state("AG-1", "backlog");
 }
 

@@ -70,7 +70,12 @@ fn identifier(s: &str) -> Result<()> {
     Ok(())
 }
 fn encode<T: serde::Serialize>(v: &T) -> Result<String> {
-    Ok(serde_json::to_string(v)?)
+    let encoded = serde_json::to_string(v)?;
+    // Serialization itself has no nesting limit. Never commit JSON that the
+    // normal bounded readers cannot reopen (including snapshots and replay).
+    serde_json::from_str::<Value>(&encoded)
+        .map_err(|_| invalid("stored data exceeds the supported JSON nesting limit"))?;
+    Ok(encoded)
 }
 fn get<T: DeserializeOwned>(tx: &Connection, table: &str, id: &str) -> Result<T> {
     let doc: Option<String> = tx
@@ -1239,6 +1244,8 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
                 created_at: now(),
                 updated_at: now(),
                 lease: None,
+                submission: None,
+                review: None,
             };
             if let Some(a) = &i.assignee {
                 active_agent(tx, a)?;
@@ -1331,6 +1338,13 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
                 i.sprint = sprint;
             }
             validate_issue(tx, &i)?;
+            if !i.state.terminal() {
+                i.submission = None;
+                i.review = None;
+                if i.state == State::InReview {
+                    i.state = State::InProgress;
+                }
+            }
             save(tx, actor, &mut i, "issue_updated")
         }
         IssueAssign {
@@ -1345,6 +1359,7 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
             }
             // Explicit reassignment revokes a claim and returns interrupted work to ready.
             if i.lease.is_some()
+                || i.state == State::InReview
                 || (i.assignee != assignee
                     && matches!(i.state, State::InProgress | State::InReview))
             {
@@ -1352,6 +1367,10 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
                 i.lease = None;
             }
             i.assignee = assignee;
+            if !i.state.terminal() {
+                i.submission = None;
+                i.review = None;
+            }
             save(tx, actor, &mut i, "issue_assigned")
         }
         IssueTransition {
@@ -1363,6 +1382,25 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
             let mut i: Issue = get(tx, "issues", &key)?;
             revision(&i, expected_revision)?;
             lease_check(&i, actor, lease_token.as_deref())?;
+            if state == State::InReview {
+                return Err(conflict(
+                    "submit evidence with issue_submit to enter review",
+                ));
+            }
+            if state == State::Done {
+                let accepted = i.submission.as_ref().zip(i.review.as_ref()).is_some_and(
+                    |(submission, review)| {
+                        review.approved
+                            && review.submission_id == submission.id
+                            && review.actor != submission.actor
+                    },
+                );
+                if !accepted {
+                    return Err(conflict(
+                        "closure requires evidence and independent approval of the current submission",
+                    ));
+                }
+            }
             if !i.state.permits(state) {
                 return Err(conflict(format!(
                     "transition {:?} -> {:?} is not allowed",
@@ -1419,10 +1457,92 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
                 }
             }
             i.state = state;
+            if state != State::Done {
+                i.submission = None;
+                i.review = None;
+            }
             if !matches!(state, State::InProgress | State::InReview) {
                 i.lease = None;
             }
             save(tx, actor, &mut i, "issue_transitioned")
+        }
+        IssueSubmit {
+            key,
+            expected_revision,
+            lease_token,
+            summary,
+            evidence,
+        } => {
+            let mut i: Issue = get(tx, "issues", &key)?;
+            revision(&i, expected_revision)?;
+            lease_check(&i, actor, lease_token.as_deref())?;
+            if i.state != State::InProgress || i.assignee.as_deref() != Some(actor) {
+                return Err(conflict(
+                    "only the assigned worker may submit in-progress work",
+                ));
+            }
+            if !blockers(tx, &key)?.is_empty() {
+                return Err(conflict("unresolved blocking issues"));
+            }
+            nonempty(&summary, "submission summary")?;
+            if evidence.is_empty() || evidence.len() > 64 {
+                return Err(invalid("supply 1–64 evidence references"));
+            }
+            for e in &evidence {
+                nonempty(&e.reference, "evidence reference")?;
+                nonempty(&e.summary, "evidence summary")?;
+            }
+            i.submission = Some(Submission {
+                id: uuid::Uuid::new_v4().to_string(),
+                actor: actor.into(),
+                at: now(),
+                revision: i.revision + 1,
+                summary,
+                evidence,
+                issue_snapshot: json!({"title":i.title,"description":i.description,"acceptance_criteria":i.acceptance_criteria,"metadata":i.metadata,"assignee":i.assignee}),
+            });
+            i.review = None;
+            i.state = State::InReview;
+            i.lease = None;
+            save(tx, actor, &mut i, "evidence_submitted")
+        }
+        IssueReview {
+            key,
+            expected_revision,
+            submission_id,
+            approved,
+            note,
+        } => {
+            let mut i: Issue = get(tx, "issues", &key)?;
+            revision(&i, expected_revision)?;
+            if i.state != State::InReview {
+                return Err(conflict("issue is not awaiting review"));
+            }
+            let submission = i
+                .submission
+                .as_ref()
+                .ok_or_else(|| conflict("no evidence submission"))?;
+            if submission.id != submission_id {
+                return Err(conflict("submission changed; inspect current evidence"));
+            }
+            if submission.actor == actor || i.assignee.as_deref() == Some(actor) {
+                return Err(conflict("reviewer must be independent of the worker"));
+            }
+            nonempty(&note, "review note")?;
+            if i.review.is_some() {
+                return Err(conflict(
+                    "submission already reviewed; resubmit changed work",
+                ));
+            }
+            i.review = Some(Review {
+                submission_id,
+                actor: actor.into(),
+                at: now(),
+                approved,
+                note,
+                external_outcome_verified: false,
+            });
+            save(tx, actor, &mut i, "review_recorded")
         }
         IssueClaim {
             project,
@@ -1771,7 +1891,7 @@ fn execute(tx: &Transaction<'_>, actor: &str, c: Command) -> Result<Value> {
             ];
             let transitions:Vec<_>=states.iter().map(|s|json!({"from":s,"to":states.iter().filter(|t|s.permits(**t)).collect::<Vec<_>>()})).collect();
             Ok(
-                json!({"states":states,"transitions":transitions,"hierarchy":"epic -> story/task/bug/spike -> subtask"}),
+                json!({"states":states,"transitions":transitions,"hierarchy":"epic -> story/task/bug/spike -> subtask","gates":{"in_review":"issue_submit with assigned worker evidence, releases claim","done":"independent issue_review approval of current submission required"},"external_outcome_verified":false}),
             )
         }
     }

@@ -1070,7 +1070,18 @@ function renderDetail() {
         ),
       ),
     );
-  nodes.push(detailSection("Comments & evidence", commentsContent()));
+  if (i.submission) {
+    nodes.push(detailSection("Submitted evidence", h("div", {},
+      h("p", {className: "prose"}, `${i.submission.actor} · revision ${i.submission.revision}: ${i.submission.summary}`),
+      h("pre", {className: "metadata"}, JSON.stringify(i.submission.evidence, null, 2)),
+      h("details", {}, h("summary", {}, "Submitted issue snapshot"), h("pre", {className: "metadata"}, JSON.stringify(i.submission.issue_snapshot, null, 2))))));
+  }
+  if (i.review) {
+    nodes.push(detailSection("Independent review", h("div", {},
+      h("p", {className: "prose"}, `${i.review.actor}: ${i.review.approved ? "Approved" : "Changes requested"}. ${i.review.note}`),
+      h("p", {className: "muted prose"}, "Review record only. Workboard does not verify external outcomes."))));
+  }
+  nodes.push(detailSection("Comments & handoffs", commentsContent()));
   nodes.push(
     detailSection(
       "Issue history",

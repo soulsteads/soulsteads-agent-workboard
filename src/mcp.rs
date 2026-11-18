@@ -23,6 +23,36 @@ fn tool_schema() -> Value {
             }
         }
     }
+    // Some harnesses construct tool arguments from top-level properties and
+    // otherwise send {} for a tagged union. Advertise the union there as well;
+    // keep oneOf authoritative for required fields and per-operation rejection.
+    let mut fields = std::collections::BTreeMap::<String, Vec<Value>>::new();
+    if let Some(variants) = schema["oneOf"].as_array() {
+        for variant in variants {
+            for (name, value) in variant["properties"]
+                .as_object()
+                .expect("command properties")
+            {
+                let choices = fields.entry(name.clone()).or_default();
+                if !choices.contains(value) {
+                    choices.push(value.clone());
+                }
+            }
+        }
+    }
+    let properties: serde_json::Map<String, Value> = fields
+        .into_iter()
+        .map(|(name, choices)| {
+            let value = if choices.len() == 1 {
+                choices[0].clone()
+            } else {
+                json!({"anyOf":choices})
+            };
+            (name, value)
+        })
+        .collect();
+    schema["properties"] = json!(properties);
+    schema["required"] = json!(["op"]);
     schema
 }
 fn rpc_error(id: Value, code: i64, message: &str) -> Value {
@@ -225,7 +255,7 @@ impl Server {
                 else {
                     return Some(rpc_error(id, -32602, "project argument required"));
                 };
-                json!({"description":"Agent work loop","messages":[{"role":"user","content":{"type":"text","text":format!("Work on project {project}. Inspect the board and claim a ready issue using issue_claim. If claimed is null, report no available work. Read full issue context, linked dependencies and acceptance criteria. Retain the claim token, heartbeat before expiry, and use the latest revision and lease_token for edits/transitions. Add evidence in a comment, transition through in_review to done only after validation. Release interrupted work; never submit work with an expired or revoked token. Use events for handoff context.")}}]})
+                json!({"description":"Agent work loop","messages":[{"role":"user","content":{"type":"text","text":format!("Work on project {project}. Inspect the board and claim a ready issue using issue_claim. If claimed is null, report no available work. Read full issue context, linked dependencies and acceptance criteria. Retain the claim token, heartbeat before expiry, and use the latest revision and lease_token for edits/transitions. Use issue_submit with evidence references and current lease to enter in_review; a different actor must issue_review the submission before issue_transition to done. Workboard records review, not external outcome verification. Release interrupted work; never submit work with an expired or revoked token. Use events for handoff context.")}}]})
             }
             _ => return Some(rpc_error(id, -32601, "method not found")),
         };

@@ -54,7 +54,7 @@ impl State {
             (self, target),
             (Backlog, Ready | Canceled)
                 | (Ready, Backlog | InProgress | Blocked | Canceled)
-                | (InProgress, Ready | Blocked | InReview | Done | Canceled)
+                | (InProgress, Ready | Blocked | InReview | Canceled)
                 | (Blocked, Ready | InProgress | Backlog | Canceled)
                 | (InReview, InProgress | Blocked | Done | Canceled)
                 | (Done | Canceled, Backlog)
@@ -110,6 +110,36 @@ pub struct Issue {
     pub created_at: i64,
     pub updated_at: i64,
     pub lease: Option<Lease>,
+    #[serde(default)]
+    pub submission: Option<Submission>,
+    #[serde(default)]
+    pub review: Option<Review>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Evidence {
+    pub reference: String,
+    pub summary: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Submission {
+    pub id: String,
+    pub actor: String,
+    pub at: i64,
+    pub revision: i64,
+    pub summary: String,
+    pub evidence: Vec<Evidence>,
+    pub issue_snapshot: Value,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Review {
+    pub submission_id: String,
+    pub actor: String,
+    pub at: i64,
+    pub approved: bool,
+    pub note: String,
+    /// Workboard records an independent review, never verifies external effects.
+    pub external_outcome_verified: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Link {
@@ -306,6 +336,21 @@ pub enum Command {
         state: State,
         #[serde(default)]
         lease_token: Option<String>,
+    },
+    IssueSubmit {
+        key: String,
+        expected_revision: i64,
+        #[serde(default)]
+        lease_token: Option<String>,
+        summary: String,
+        evidence: Vec<Evidence>,
+    },
+    IssueReview {
+        key: String,
+        expected_revision: i64,
+        submission_id: String,
+        approved: bool,
+        note: String,
     },
     IssueClaim {
         project: String,
