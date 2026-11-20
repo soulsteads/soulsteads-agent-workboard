@@ -1,6 +1,6 @@
 [package]
 name = "soulsteads-agent-workboard"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Durable issue coordination for autonomous agents, via JSON CLI and MCP"
 license = "Apache-2.0"
