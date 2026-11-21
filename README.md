@@ -64,53 +64,68 @@ All screenshots use a disposable demo workspace. To regenerate them, see
 
 ## Quickstart
 
-You need Rust's stable toolchain and a C compiler. SQLite is bundled; Node.js and
-Python are not runtime dependencies.
+This walkthrough creates a disposable local SQLite board. Start in a new, empty
+working directory and use a fresh database file; do not point it at an existing
+board. It needs no AI-provider account, model, Forge, or external database.
 
 ### 1. Install
 
-From this repository:
+From a source checkout (a stable Rust/Cargo toolchain and a C compiler are required;
+SQLite is bundled):
 
 ```bash
 cargo install --locked --path .
+```
+
+**No prebuilt binary is published.** The source command above builds from source and
+requires the listed toolchain. A Linux candidate package can be built locally and run
+without Cargo, but use it only for private QA: it is not a published release or a
+released toolchain-free installation. Use only a trusted local candidate built via
+the [Linux candidate packaging instructions](#linux-candidate-packaging). Verify its
+`.sha256` sidecar, extract the archive, and put the extracted package directory on
+`PATH`. `BUILD-INFO.txt` records the candidate's source identity and runtime
+requirements.
+
+### 2. Create one project and one ready story
+
+```bash
+set -eu
+umask 077
+mkdir -m 700 -- workboard-first-run
+cd -- ./workboard-first-run
 export WORKBOARD_DB="$PWD/workboard.sqlite3"
-export WORKBOARD_ACTOR="coordinator"
+export WORKBOARD_ACTOR=local
+unset WORKBOARD_API_KEY
+
+workboard run '{"op":"agent_register","id":"local","name":"Local user"}'
+workboard run '{"op":"project_create","key":"DEMO","name":"Disposable demo"}'
+workboard run '{"op":"issue_create","project":"DEMO","kind":"story","title":"Try the first run"}'
+workboard run '{"op":"issue_transition","key":"DEMO-1","expected_revision":1,"state":"ready"}'
+workboard run '{"op":"issue_get","key":"DEMO-1"}'
 ```
 
-Use an absolute database path so every local process opens the same board. Its
-parent directory must already exist.
+The database lives in this new directory. Stop any running Workboard process,
+then delete the directory to discard the board.
 
-### 2. Create a workspace
+### 3. Optional: open the local dashboard
 
-Run these commands in a fresh database, with `WORKBOARD_API_KEY` unset:
+Create a Workboard credential locally, then start the dashboard on loopback:
 
 ```bash
-workboard run '{"op":"agent_register","id":"coordinator","name":"Coordinator"}'
-workboard run '{"op":"agent_register","id":"forge","name":"Forge","capabilities":["rust","tests"]}'
-workboard run '{"op":"project_create","key":"AG","name":"Agent platform"}'
-workboard run '{"op":"issue_create","project":"AG","kind":"epic","title":"Ship agent coordination"}'
-workboard run '{"op":"issue_create","project":"AG","kind":"story","title":"Implement the work loop","parent":"AG-1","acceptance_criteria":["Integration tests pass"]}'
-workboard run '{"op":"issue_transition","key":"AG-2","expected_revision":1,"state":"ready"}'
+workboard run '{"op":"api_key_create","agent":"local","label":"Local dashboard"}'
+workboard web --listen 127.0.0.1:7878
 ```
 
-Identities and project keys are stable: duplicate registrations and creations
-return a conflict. For an existing board, start with `agent_list`, `project_list`,
-and `board` instead.
-
-### 3. Issue a key and open the dashboard
-
-```bash
-workboard run '{"op":"api_key_create","agent":"forge","label":"Forge workstation"}'
-workboard web
-```
-
-Save the returned `api_key` privately; the secret is shown only once. Open
-**http://127.0.0.1:7878** and enter that key. The ready story will appear on the
-board, waiting for an agent to claim it.
-
-Leave the server running and connect the worker from another terminal or client.
+Save the returned `api_key` privately; Workboard shows it only once. It authenticates
+to this local Workboard dashboard/API only. It is not an AI-provider account or
+AI-provider API key. On this machine, open **http://127.0.0.1:7878** and enter it.
+The dashboard is bound to loopback, not exposed to the network.
 
 ## Connect your agents
+
+Examples below that use `AG` or `AG-*` are illustrative and assume a separate board
+with an `AG` project; they are independent of the disposable `DEMO` board created by
+the Quickstart.
 
 Each worker gets its own registered agent identity and an assigned key. Set
 `WORKBOARD_API_KEY` privately in the worker's environment; it determines the actor
@@ -392,6 +407,44 @@ cargo build --locked --release
 uv run --locked scripts/validate_mcp.py target/release/workboard
 uv run --locked scripts/validate_web.py target/release/workboard --install-browser
 ```
+
+### Linux candidate packaging
+
+The packager builds a locked `x86_64-unknown-linux-gnu` candidate and writes a
+SHA-256 sidecar. It then extracts the archive and smoke-tests the binary with a
+fresh home and SQLite database, without Cargo or inherited credentials.
+
+Choose a new output path whose parent already exists. The packager refuses to
+reuse an existing path and creates the output directory with owner-only permissions.
+Both the output and Cargo target paths must resolve outside the source tree. Use
+the QA script only with a candidate you built and control in a private directory,
+not with a downloaded or untrusted archive. The packager writes `QA.txt`; a direct
+QA run defaults to `<archive>.qa.txt`. The script refuses to overwrite an existing
+receipt. These receipts are private test evidence, not release artifacts or installers.
+
+```bash
+CARGO_BUILD_JOBS=2 \
+CARGO_TARGET_DIR="$(cd .. && pwd -P)/target" \
+scripts/package_linux_candidate.sh "$(cd .. && pwd -P)/candidate"
+(cd ../candidate && sha256sum -c *.sha256)
+```
+
+Build prerequisites are Linux x86_64, Bash, Git, Rust/Cargo, a C compiler and linker,
+Python 3, GNU tar/gzip, `readelf`, `ldd`, `sha256sum`, `curl`, and standard core
+utilities. Runtime prerequisites
+are glibc and the shared libraries listed in the archive's `BUILD-INFO.txt`; SQLite
+is bundled, so no SQLite server, Cargo, Python, AI account, or model is needed at
+runtime. The build info records the target, compiler versions, lockfile hash, source
+revision, and a digest of tracked working-tree files using Git's file types and
+executable bit rather than local permission masks. The digest excludes ignored
+build/dependency state, and packaging refuses non-ignored untracked files to avoid
+omitting source inputs. For the pinned source fallback, check out the
+recorded `source_revision`; if `source_tree_state=dirty`, that commit is only the
+base, so apply the reviewed source changes and confirm `source_tree_sha256` before
+rebuilding. CI does not upload candidate binaries. The local QA receipt is private
+evidence only; this entry creates no public tag or GitHub Release. Promote a candidate
+only after review, from a clean source tree whose tag commit and tree digest match the
+`BUILD-INFO.txt` identity.
 
 The suite covers concurrent claims, stale revisions, lease recovery, rollback,
 hierarchy and dependency guards, key identity and revocation, migration, and
