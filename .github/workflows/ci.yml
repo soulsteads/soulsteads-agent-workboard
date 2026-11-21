@@ -3,8 +3,17 @@ on: [push, pull_request]
 jobs:
   rust-mcp-and-web:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: 2
+      WORKBOARD_LINUX_TARGET: x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set runner-local Cargo target directory
+        run: echo "CARGO_TARGET_DIR=${{ runner.temp }}/workboard-target" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -12,9 +21,9 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
-      - run: cargo build --locked --release
-      - run: uv run --locked scripts/validate_mcp.py target/release/workboard
-      - run: uv run --locked scripts/validate_web.py target/release/workboard --install-browser --with-deps --screenshots artifacts/web
+      - run: scripts/package_linux_candidate.sh "${{ runner.temp }}/workboard-candidate"
+      - run: uv run --locked scripts/validate_mcp.py "${{ runner.temp }}/workboard-target/x86_64-unknown-linux-gnu/release/workboard"
+      - run: uv run --locked scripts/validate_web.py "${{ runner.temp }}/workboard-target/x86_64-unknown-linux-gnu/release/workboard" --install-browser --with-deps --screenshots artifacts/web
       - uses: actions/upload-artifact@v4
         if: always()
         with:
