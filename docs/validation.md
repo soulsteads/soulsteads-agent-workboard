@@ -56,6 +56,22 @@ without sleeps. Process concurrency tests start eight workers behind a barrier.
 The suite checks rollback of both state and audit events, and refuses unknown
 future database versions.
 
+For a separate stopped-backup rehearsal, build the binary and run the local
+standard-library driver against a new, private evidence directory:
+
+```sh
+cargo build --locked --release --bin workboard
+scratch=$(mktemp -d)
+python3 scripts/validate_recovery.py target/release/workboard "$scratch/recovery"
+```
+
+The driver creates a disposable SQLite board. Separate CLI processes race for a
+lease, reclaim it after expiry, reject the prior owner's write, and check retry
+and handoff. After the writers exit, the driver copies the stopped database and
+compares the restored issue and event history. It records the binary digest in
+`result.json`. This checks board state, not the recovery or replay of an agent's
+external actions.
+
 Operating boundaries are explicit in the README: trusted cooperating agents,
 key-required HTTP access, local SQLite storage, direct blocking semantics and mutation
 deduplication only for requests that carry an idempotency key. Unkeyed CLI/MCP remains a trusted local operator
