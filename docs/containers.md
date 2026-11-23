@@ -7,6 +7,12 @@ No registry account or host language toolchain is required; the build pulls
 public base images. Use `engine=podman` in place of `engine=docker` for all
 commands below.
 
+For the loopback-only port mapping in this guide, use Docker Engine 28.0.0 or
+newer, or Podman. With Docker, check the server version using `docker version`.
+Do not use older Docker Engine versions for this recipe: a port published to
+`127.0.0.1` is not guaranteed to stay on the host. See Docker’s
+[port-publishing guidance](https://docs.docker.com/engine/network/port-publishing/#publishing-ports).
+
 ```sh
 engine=docker                   # or: engine=podman
 image=localhost/soulsteads-agent-workboard:local
