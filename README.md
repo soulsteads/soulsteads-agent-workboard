@@ -64,6 +64,8 @@ All screenshots use a disposable demo workspace. To regenerate them, see
 
 ## Quickstart
 
+Prefer Docker or Podman? See the [container deployment guide](docs/containers.md).
+
 You need Rust's stable toolchain and a C compiler. SQLite is bundled; Node.js and
 Python are not runtime dependencies.
 
