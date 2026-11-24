@@ -10,6 +10,7 @@ Changes since [`v0.1.0`](https://github.com/soulsteads/soulsteads-agent-workboar
 - **systemd:** add `service install --user|--system [--run-as USER] [--dry-run]`. It renders or creates one non-overwriting unit for the foreground loopback server and never opens a database, invokes a service manager, enables, or starts a service.
 - **Containers and releases:** add non-root Docker/Podman deployment guidance and release asset builds for published GitHub releases.
 - **Review closure:** require submitted evidence and an independent review before new work can complete.
+- **SQLite startup:** retry temporary lock contention when enabling WAL so concurrent openers can finish upgrading an older board.
 
 ### Included commits
 

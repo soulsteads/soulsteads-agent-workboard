@@ -1079,6 +1079,50 @@ fn a_version_three_database_migrates_with_its_history_searchable() {
 }
 
 #[test]
+fn opening_an_old_database_waits_for_a_writer_before_enabling_wal() {
+    use std::{sync::mpsc, thread, time::Duration};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy-writer.sqlite3");
+    legacy_database(&path, 3);
+    let writer = Connection::open(&path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let count: i64 = writer
+        .query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 3);
+
+    let (started, opening) = mpsc::channel();
+    let (done, result) = mpsc::channel();
+    let open_path = path.clone();
+    let opener = thread::spawn(move || {
+        started.send(()).unwrap();
+        done.send(Store::open(open_path).map(|_| ())).unwrap();
+    });
+    opening.recv().unwrap();
+    // Switching a rollback-journal database to WAL requires an exclusive lock.
+    // Keep the writer active until open has either failed early or had time to retry.
+    let while_locked = result.recv_timeout(Duration::from_millis(300));
+    writer.execute_batch("ROLLBACK").unwrap();
+    opener.join().unwrap();
+    match while_locked {
+        Ok(Err(err)) => panic!("opener returned while the write lock was held: {err}"),
+        Err(mpsc::RecvTimeoutError::Timeout) => result.recv().unwrap().unwrap(),
+        other => panic!("unexpected result while the read lock was held: {other:?}"),
+    }
+
+    let conn = Connection::open(path).unwrap();
+    let mode: String = conn
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    let indexed: i64 = conn
+        .query_row("SELECT COUNT(*) FROM issue_fts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+    assert_eq!(indexed, 3);
+}
+
+#[test]
 fn many_processes_opening_an_old_database_at_once_migrate_it_exactly_once() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("race.sqlite3");
