@@ -1,12 +1,15 @@
 use crate::model::*;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -234,14 +237,36 @@ pub struct WebhookTarget {
     pub secret: String,
 }
 
+const DB_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn enable_wal(conn: &Connection) -> rusqlite::Result<()> {
+    // SQLite can skip its busy handler when switching from a rollback journal
+    // to WAL. Retry that statement only, with one deadline rather than letting
+    // each attempt start a new SQLite busy timeout.
+    conn.busy_timeout(Duration::ZERO)?;
+    let deadline = Instant::now() + DB_BUSY_TIMEOUT;
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Err(err) if err.sqlite_error_code() == Some(ErrorCode::DatabaseBusy) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(err);
+                }
+                thread::sleep(remaining.min(Duration::from_millis(20)));
+            }
+            result => return result,
+        }
+    }
+}
+
 pub struct Store {
     conn: Connection,
 }
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let mut conn = Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(10))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        enable_wal(&conn)?;
+        conn.busy_timeout(DB_BUSY_TIMEOUT)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         crate::schema::migrate(&mut conn)?;
         Ok(Self { conn })
