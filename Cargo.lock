@@ -919,12 +919,13 @@ dependencies = [
 
 [[package]]
 name = "soulsteads-agent-workboard"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "clap",
  "futures-util",
  "hmac",
+ "libc",
  "rusqlite",
  "schemars",
  "serde",

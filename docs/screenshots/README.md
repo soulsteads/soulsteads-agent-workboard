@@ -27,7 +27,7 @@ Screenshots contain the UI's real capture-time timestamps and lease countdowns.
 
 Options:
 
-- `--binary /path/to/workboard`: capture another built binary.
+- `--binary /path/to/soulsteads-workboard`: capture another built binary.
 - `--output /tmp/workboard-shots`: save elsewhere instead of this directory.
 - `--chromium /path/to/chromium`: use an existing browser.
 

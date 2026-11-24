@@ -2,13 +2,17 @@ use agent_workboard::{Command, Store, mcp, web};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::{
+    ffi::CString,
+    fs::{self, OpenOptions},
+    io::Write,
     io::{self, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
 };
 
 #[derive(Parser)]
 #[command(
+    name = "soulsteads-workboard",
     version,
     about = "Issue coordination for agents. JSON on stdout; diagnostics on stderr."
 )]
@@ -47,6 +51,220 @@ enum Mode {
         #[arg(long, default_value = "127.0.0.1:7878")]
         listen: std::net::SocketAddr,
     },
+    /// Install a systemd unit for the foreground dashboard server.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Write a new unit only; it never enables, starts, or opens the database.
+    Install {
+        /// Install into the invoking user's systemd unit directory (the default).
+        #[arg(long)]
+        user: bool,
+        /// Install into /etc/systemd/system; requires --run-as and root privileges.
+        #[arg(long)]
+        system: bool,
+        /// Non-root account used by a system unit. Required with --system.
+        #[arg(long)]
+        run_as: Option<String>,
+        /// Print the unit instead of writing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+const UNIT_NAME: &str = "soulsteads-workboard.service";
+
+fn invalid(message: impl Into<String>) -> serde_json::Value {
+    json!({"code":"invalid","message":message.into()})
+}
+
+fn io_error(error: impl std::fmt::Display) -> serde_json::Value {
+    json!({"code":"io","message":error.to_string()})
+}
+
+fn systemd_argument(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len() + 2);
+    encoded.push('"');
+    for character in value.chars() {
+        match character {
+            '\\' => encoded.push_str("\\\\"),
+            '"' => encoded.push_str("\\\""),
+            '\n' => encoded.push_str("\\n"),
+            '\r' => encoded.push_str("\\r"),
+            '\t' => encoded.push_str("\\t"),
+            '%' => encoded.push_str("%%"),
+            '$' => encoded.push_str("$$"),
+            c if c.is_control() => {
+                for byte in c.to_string().bytes() {
+                    encoded.push_str(&format!("\\x{byte:02X}"));
+                }
+            }
+            c => encoded.push(c),
+        }
+    }
+    encoded.push('"');
+    encoded
+}
+
+fn user_unit_directory() -> Result<PathBuf, serde_json::Value> {
+    if let Some(config) = std::env::var_os("XDG_CONFIG_HOME") {
+        let config = PathBuf::from(config);
+        if !config.is_absolute() {
+            return Err(invalid("XDG_CONFIG_HOME must be an absolute path"));
+        }
+        return Ok(config.join("systemd/user"));
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| invalid("HOME is required when XDG_CONFIG_HOME is unset"))?;
+    if !home.is_absolute() {
+        return Err(invalid("HOME must be an absolute path"));
+    }
+    Ok(home.join(".config/systemd/user"))
+}
+
+fn validated_system_account(name: &str) -> Result<(), serde_json::Value> {
+    if name.is_empty()
+        || !(name.as_bytes()[0].is_ascii_alphabetic() || name.starts_with('_'))
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return Err(invalid("--run-as must name an existing local account"));
+    }
+    let name = CString::new(name).map_err(|_| invalid("--run-as must not contain NUL"))?;
+    // getpwnam is only used to validate a requested local account before its name is
+    // placed in the unit. The returned record is read immediately and not retained.
+    let record = unsafe { libc::getpwnam(name.as_ptr()) };
+    if record.is_null() {
+        return Err(invalid("--run-as must name an existing local account"));
+    }
+    let uid = unsafe { (*record).pw_uid };
+    if uid == 0 {
+        return Err(invalid("--run-as must name a non-root account"));
+    }
+    Ok(())
+}
+
+fn rendered_unit(
+    executable: &Path,
+    database: &Path,
+    actor: &str,
+    system_user: Option<&str>,
+) -> Result<String, serde_json::Value> {
+    let executable = executable
+        .to_str()
+        .ok_or_else(|| invalid("current executable path must be valid UTF-8"))?;
+    let database = database
+        .to_str()
+        .ok_or_else(|| invalid("service database path must be valid UTF-8"))?;
+    let mut unit = String::from(
+        "[Unit]\nDescription=Soulsteads Workboard dashboard\nAfter=network.target\n\n[Service]\nType=simple\n",
+    );
+    if let Some(user) = system_user {
+        unit.push_str("User=");
+        unit.push_str(user);
+        unit.push('\n');
+    }
+    unit.push_str("UMask=0077\nRestart=on-failure\nRestartSec=5s\nExecStart=");
+    for argument in [
+        executable,
+        "--db",
+        database,
+        "--actor",
+        actor,
+        "web",
+        "--listen",
+        "127.0.0.1:7878",
+    ] {
+        unit.push_str(&systemd_argument(argument));
+        unit.push(' ');
+    }
+    unit.pop();
+    unit.push_str("\n\n[Install]\nWantedBy=");
+    unit.push_str(if system_user.is_some() {
+        "multi-user.target"
+    } else {
+        "default.target"
+    });
+    unit.push('\n');
+    Ok(unit)
+}
+
+fn write_new_unit(path: &Path, unit: &str) -> Result<(), serde_json::Value> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                invalid(format!(
+                    "refusing to overwrite existing unit {}",
+                    path.display()
+                ))
+            } else {
+                io_error(error)
+            }
+        })?;
+    file.write_all(unit.as_bytes()).map_err(io_error)?;
+    file.sync_all().map_err(io_error)
+}
+
+fn install_service(
+    database: &Path,
+    actor: &str,
+    user: bool,
+    system: bool,
+    run_as: Option<&str>,
+    dry_run: bool,
+) -> Result<(), serde_json::Value> {
+    if user && system {
+        return Err(invalid("choose at most one of --user and --system"));
+    }
+    if !database.is_absolute() {
+        return Err(invalid("service install requires an absolute --db path"));
+    }
+    let executable = std::env::current_exe().map_err(io_error)?;
+    if !executable.is_absolute() {
+        return Err(io_error("current executable path is not absolute"));
+    }
+    let (target, system_user) = if system {
+        let account = run_as.ok_or_else(|| invalid("--system requires --run-as USER"))?;
+        validated_system_account(account)?;
+        if !dry_run && unsafe { libc::geteuid() } != 0 {
+            return Err(invalid("--system installation requires root privileges"));
+        }
+        (
+            PathBuf::from("/etc/systemd/system").join(UNIT_NAME),
+            Some(account),
+        )
+    } else {
+        if run_as.is_some() {
+            return Err(invalid("--run-as is only valid with --system"));
+        }
+        (user_unit_directory()?.join(UNIT_NAME), None)
+    };
+    let unit = rendered_unit(&executable, database, actor, system_user)?;
+    if dry_run {
+        print!("{unit}");
+        return Ok(());
+    }
+    if !system {
+        fs::create_dir_all(
+            target
+                .parent()
+                .expect("a systemd unit target always has a parent"),
+        )
+        .map_err(io_error)?;
+    }
+    write_new_unit(&target, &unit)?;
+    println!("installed {}", target.display());
+    Ok(())
 }
 fn main() -> ExitCode {
     let args = Args::parse();
@@ -62,6 +280,25 @@ fn run(mut args: Args) -> Result<(), serde_json::Value> {
     if matches!(args.mode, Mode::Schema) {
         println!("{}", mcp::command_schema());
         return Ok(());
+    }
+    if let Mode::Service {
+        command:
+            ServiceCommand::Install {
+                user,
+                system,
+                run_as,
+                dry_run,
+            },
+    } = args.mode
+    {
+        return install_service(
+            &args.db,
+            &args.actor,
+            user,
+            system,
+            run_as.as_deref(),
+            dry_run,
+        );
     }
     let mut store = match Store::open(&args.db) {
         Ok(store) => store,
@@ -142,7 +379,7 @@ fn run(mut args: Args) -> Result<(), serde_json::Value> {
                 .block_on(web::serve(store, listen))
                 .map_err(|e| json!({"code":"io","message":e.to_string()}))?;
         }
-        Mode::Schema => unreachable!(),
+        Mode::Schema | Mode::Service { .. } => unreachable!(),
     }
     Ok(())
 }

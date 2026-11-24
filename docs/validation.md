@@ -8,12 +8,12 @@ cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --locked --release
-uv run --locked scripts/validate_mcp.py target/release/workboard
-uv run --locked scripts/validate_web.py target/release/workboard --install-browser
+uv run --locked scripts/validate_mcp.py target/release/soulsteads-workboard
+uv run --locked scripts/validate_web.py target/release/soulsteads-workboard --install-browser
 ```
 
-Validated on Linux with Rust/Cargo 1.99.1. The Rust suite has 56 integration tests
-(10 domain, 4 interface/process, 7 web/authentication, 17 push, 15 search, and 3 cycle tests) plus 13 unit tests. Development dependencies for the
+Validated on Linux with Rust/Cargo 1.99.1. The Rust suite has 69 integration tests
+(3 cycle, 10 domain, 4 interface/process, 23 push, 3 review, 15 search, 4 service-installation, and 7 web/authentication tests) plus 13 unit tests. Development dependencies for the
 SDK validator are pinned in `scripts/validate_mcp.py.lock` and `scripts/validate_web.py.lock`; Rust dependencies are
 pinned in `Cargo.lock`. The command engine, HTTP server, CLI and MCP are Rust; the embedded dashboard
 uses plain JavaScript and CSS. Python is used only for independent SDK and
@@ -22,6 +22,7 @@ browser integration validation.
 | Requested capability | Authoritative implementation | Observable validation |
 | --- | --- | --- |
 | Rust end-to-end implementation | `src/model.rs`, `src/store.rs`, `src/main.rs`, `src/mcp.rs` | Locked release build, compiled CLI/MCP process tests, SDK validator against release binary |
+| systemd installation | `service install --user|--system [--run-as USER] [--dry-run]` in `src/main.rs` | Real CLI dry-run, disposable user-unit write, existing-file/symlink refusal, and relative-db/system-account rejection without invoking a service manager |
 | Epics, user stories, bugs and related types | `IssueKind`, issue creation and parent validation | `full_epic_story_bug_subtask_workflow_and_persistence` creates epic/story/bug/subtask; `sprints_filters_pagination_and_agent_lifecycle` exercises task/spike |
 | Issue linking | Link operations and combined completion graph | `dependencies_cycles_links_and_claim_selection` checks blockers, related links, self-links, cycles and selection; `completion_cycles_include_hierarchy_and_reopened_blockers` checks hierarchy deadlocks and reopen guards |
 | Assignment to agents | Registry, active-agent checks, assignment and claims | `leases_fence_stale_workers_renew_release_and_reassignment`, `sprints_filters_pagination_and_agent_lifecycle`, `blocking_canceling_unassigning_and_incremental_handoffs` |

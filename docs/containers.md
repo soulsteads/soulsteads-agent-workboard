@@ -53,7 +53,7 @@ The wildcard bind is confined to the container's network; the published host
 port is loopback-only. Keep the container on a network with only trusted peers.
 The dashboard and API require a scoped worker key for data access. Follow the
 [key step](../README.md#3-issue-a-key-and-open-the-dashboard), using `wb run` in
-place of `workboard run` and the worker ID you registered. Handle the one-time
+place of `soulsteads-workboard run` and the worker ID you registered. Handle the one-time
 key output privately. Open <http://127.0.0.1:7878/> and use the key to inspect
 the intended board. Use HTTPS with a trusted reverse proxy beyond localhost;
 do not publish the raw API to the network.

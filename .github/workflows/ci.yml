@@ -13,8 +13,8 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo build --locked --release
-      - run: uv run --locked scripts/validate_mcp.py target/release/workboard
-      - run: uv run --locked scripts/validate_web.py target/release/workboard --install-browser --with-deps --screenshots artifacts/web
+      - run: uv run --locked scripts/validate_mcp.py target/release/soulsteads-workboard
+      - run: uv run --locked scripts/validate_web.py target/release/soulsteads-workboard --install-browser --with-deps --screenshots artifacts/web
       - uses: actions/upload-artifact@v4
         if: always()
         with:

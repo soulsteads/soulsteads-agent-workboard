@@ -1,7 +1,7 @@
 # Command reference
 
-All commands are JSON objects containing `op`. Send the object to `workboard run`
-or as MCP `workboard_execute` arguments. `workboard schema` provides the complete
+All commands are JSON objects containing `op`. Send the object to `soulsteads-workboard run`
+or as MCP `workboard_execute` arguments. `soulsteads-workboard schema` provides the complete
 machine-readable union, defaults and enum values. Unknown fields are rejected.
 Strings use UTF-8. Timestamps are Unix seconds. Issue revisions begin at 1.
 
@@ -174,7 +174,7 @@ reconnect and reconcile state before retrying work.
 
 ## HTTP access
 
-`workboard web` serves the embedded dashboard and HTTP API. Every `/api` endpoint
+`soulsteads-workboard web` serves the embedded dashboard and HTTP API. Every `/api` endpoint
 requires `Authorization: Bearer <api_key>` for an active registered agent. Missing,
 invalid and revoked keys return 401. The key determines the actor for mutations.
 Keys grant board-wide coordination access in the trusted agent pool, not only
@@ -214,6 +214,59 @@ Policy, `nosniff` and no referrer forwarding. The UI renders issue/comment text 
 text, never HTML, including metadata and event snapshots. API keys live in the
 browser tab's session storage, never URLs. They are removed on sign-out or 401.
 Use HTTPS when making the service accessible beyond localhost.
+
+## systemd service installation
+
+`service install` writes one new unit for the real foreground `web` server. It
+uses the executable that invoked the installer, passes the exact absolute `--db`
+path as an argument, and binds the dashboard to `127.0.0.1:7878`. It never opens
+or creates the database, calls `systemctl`, enables, or starts a unit. The
+installer quotes systemd arguments itself; it does not use a shell. It refuses to
+overwrite an existing unit, including a link. Move or replace the executable only
+after installing a replacement unit deliberately.
+
+Use `--dry-run` to print the exact unit without creating the unit directory or
+writing any file. Service installation requires an absolute database path so a
+restart cannot select a board from an arbitrary working directory. Create and
+secure the database parent directory before the first server start; SQLite will
+create the database and WAL sidecars when `web` runs.
+
+For a user service, the default target is
+`$XDG_CONFIG_HOME/systemd/user/soulsteads-workboard.service` (or
+`$HOME/.config/systemd/user/...` when `XDG_CONFIG_HOME` is unset):
+
+```sh
+install -d -m 0700 "$HOME/.local/share/soulsteads-workboard"
+soulsteads-workboard --db "$HOME/.local/share/soulsteads-workboard/workboard.sqlite3" \
+  service install --user
+# Manual lifecycle actions; the installer did not run these:
+systemctl --user daemon-reload
+systemctl --user enable --now soulsteads-workboard.service
+systemctl --user status soulsteads-workboard.service
+```
+
+For a system service, install the binary at its permanent absolute path and use
+a dedicated existing non-root account. `--system` requires root and an explicit
+`--run-as USER`; it writes only
+`/etc/systemd/system/soulsteads-workboard.service` and will not create that
+account or its database directory:
+
+```sh
+sudo install -d -m 0700 -o soulsteads-workboard -g soulsteads-workboard /var/lib/soulsteads-workboard
+sudo install -m 0755 target/release/soulsteads-workboard /usr/local/bin/soulsteads-workboard
+sudo /usr/local/bin/soulsteads-workboard \
+  --db /var/lib/soulsteads-workboard/workboard.sqlite3 \
+  service install --system --run-as soulsteads-workboard
+# Manual lifecycle actions; the installer did not run these:
+sudo systemctl daemon-reload
+sudo systemctl enable --now soulsteads-workboard.service
+sudo systemctl status soulsteads-workboard.service
+```
+
+Keep the loopback listener behind a trusted HTTPS reverse proxy for remote access.
+The existing database's agent keys continue to authenticate dashboard and API
+requests; the unit intentionally does not place a key in its arguments or unit
+file.
 
 ### Idempotency
 
@@ -331,7 +384,7 @@ the server shuts down. Each open stream holds no database lock between checks.
 `url` must be an absolute `http` or `https` URL of at most 2048 bytes; at most 50
 webhooks may exist. `actions` lists event actions (empty means all). A webhook stores a
 `cursor` (the last event handled), `failures`, `last_error` and `last_delivered_at`,
-and sees only events after its creation. Delivery runs inside `workboard web`:
+and sees only events after its creation. Delivery runs inside `soulsteads-workboard web`:
 
 - One `POST` per event with `Content-Type: application/json`, a 10-second timeout and
   no redirects. The body is `{id, action, issue, actor, created_at, data}`.

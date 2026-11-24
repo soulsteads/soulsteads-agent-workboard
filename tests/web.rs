@@ -452,7 +452,7 @@ fn keyed_mcp_derives_identity_and_rechecks_revocation_for_each_request() {
 fn keyed_cli_uses_agent_identity_and_rejects_invalid_keys() {
     let f = Fixture::new();
     let run = |key: &str, command: Value| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_workboard"))
+        std::process::Command::new(env!("CARGO_BIN_EXE_soulsteads-workboard"))
             .args([
                 "--db",
                 f.dir.path().join("web.sqlite3").to_str().unwrap(),

@@ -1,6 +1,6 @@
 [package]
 name = "soulsteads-agent-workboard"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Durable issue coordination for autonomous agents, via JSON CLI and MCP"
 license = "Apache-2.0"
@@ -9,13 +9,14 @@ license = "Apache-2.0"
 name = "agent_workboard"
 
 [[bin]]
-name = "workboard"
+name = "soulsteads-workboard"
 path = "src/main.rs"
 
 [dependencies]
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
+libc = "0.2"
 hmac = "0.12"
 rusqlite = { version = "0.38", features = ["bundled"] }
 schemars = "1"
