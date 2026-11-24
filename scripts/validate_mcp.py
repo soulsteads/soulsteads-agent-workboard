@@ -2,7 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["mcp>=1.26,<2", "jsonschema>=4.26,<5"]
 # ///
-"""Run: uv run scripts/validate_mcp.py target/debug/workboard.
+"""Run: uv run scripts/validate_mcp.py target/debug/soulsteads-workboard.
 
 Uses the official MCP Python SDK, JSON Schema validator and the actual CLI.
 All mutations occur in a temporary database, removed after validation.
@@ -115,6 +115,6 @@ async def validate(binary: Path, database: Path):
 
 
 if __name__ == "__main__":
-    binary = Path(sys.argv[1] if len(sys.argv) > 1 else "target/debug/workboard").resolve(strict=True)
+    binary = Path(sys.argv[1] if len(sys.argv) > 1 else "target/debug/soulsteads-workboard").resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="workboard-sdk-") as directory:
         asyncio.run(validate(binary, Path(directory) / "board.sqlite3"))

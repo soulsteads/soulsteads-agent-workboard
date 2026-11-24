@@ -7,7 +7,7 @@ use std::{
 use tempfile::TempDir;
 
 fn cli(dir: &TempDir, actor: &str, command: Value) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_workboard"))
+    Command::new(env!("CARGO_BIN_EXE_soulsteads-workboard"))
         .arg("--db")
         .arg(dir.path().join("board.sqlite3"))
         .args(["--actor", actor, "run", &command.to_string()])
@@ -39,7 +39,7 @@ fn setup(dir: &TempDir) {
 fn cli_stdin_errors_schema_and_persistence() {
     let dir = tempfile::tempdir().unwrap();
     setup(&dir);
-    let mut p = Command::new(env!("CARGO_BIN_EXE_workboard"))
+    let mut p = Command::new(env!("CARGO_BIN_EXE_soulsteads-workboard"))
         .arg("--db")
         .arg(dir.path().join("board.sqlite3"))
         .args(["--actor", "a", "run"])
@@ -74,7 +74,7 @@ fn cli_stdin_errors_schema_and_persistence() {
         serde_json::from_slice::<Value>(&err.stdout).unwrap()["error"]["code"],
         "invalid"
     );
-    let schema = Command::new(env!("CARGO_BIN_EXE_workboard"))
+    let schema = Command::new(env!("CARGO_BIN_EXE_soulsteads-workboard"))
         .args(["schema"])
         .output()
         .unwrap();
@@ -144,7 +144,7 @@ fn rpc(id: i64, method: &str, params: Value) -> Value {
 #[test]
 fn mcp_stdio_handshake_tools_resources_prompts_and_errors() {
     let dir = tempfile::tempdir().unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_workboard"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_soulsteads-workboard"))
         .arg("--db")
         .arg(dir.path().join("board.sqlite3"))
         .args(["--actor", "a", "mcp"])

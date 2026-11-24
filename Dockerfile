@@ -4,7 +4,7 @@ ENV CARGO_BUILD_JOBS=2
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY web/ web/
-RUN cargo build --release --locked --bin workboard
+RUN cargo build --release --locked --bin soulsteads-workboard
 
 FROM docker.io/library/debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 LABEL org.opencontainers.image.source="https://github.com/soulsteads/soulsteads-agent-workboard"
@@ -15,11 +15,11 @@ RUN apt-get update \
     && useradd --uid 10001 --gid 10001 --home-dir /data/home --no-create-home app \
     && install -d -m 0700 -o 10001 -g 10001 /data /data/home
 COPY LICENSE NOTICE /usr/share/doc/soulsteads-agent-workboard/
-COPY --from=build /src/target/release/workboard /usr/local/bin/workboard
+COPY --from=build /src/target/release/soulsteads-workboard /usr/local/bin/soulsteads-workboard
 ENV HOME=/data/home WORKBOARD_DB=/data/workboard.sqlite3
 USER 10001:10001
 WORKDIR /data
 STOPSIGNAL SIGINT
 EXPOSE 7878
-ENTRYPOINT ["/usr/local/bin/workboard"]
+ENTRYPOINT ["/usr/local/bin/soulsteads-workboard"]
 CMD ["--help"]

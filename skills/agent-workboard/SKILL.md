@@ -5,16 +5,16 @@ description: Plan and execute agent work in Soulsteads Agent Workboard using its
 
 # Agent Workboard
 
-Use `workboard` on PATH with the configured `WORKBOARD_DB` (absolute path) and
+Use `soulsteads-workboard` on PATH with the configured `WORKBOARD_DB` (absolute path) and
 `WORKBOARD_ACTOR` (this worker's stable ID). All agents on a board share the DB
 and use distinct actor IDs. The CLI and MCP operate on the same persisted state.
 Do not silently create an unrelated board if the intended DB is unknown.
 
 ## Discover and bootstrap
 
-- `workboard schema` describes every operation, field and enum.
-- `workboard run '{"op":"project_list"}'` discovers projects.
-- `workboard run '{"op":"agent_list"}'` checks registered identities.
+- `soulsteads-workboard schema` describes every operation, field and enum.
+- `soulsteads-workboard run '{"op":"project_list"}'` discovers projects.
+- `soulsteads-workboard run '{"op":"agent_list"}'` checks registered identities.
 - Register the configured actor if missing with `agent_register` (`id`, `name`,
   optional `capabilities`). Registration of existing IDs conflicts.
 - If using MCP, send the same JSON command object directly to
@@ -23,7 +23,7 @@ Do not silently create an unrelated board if the intended DB is unknown.
 Run one command per invocation. Large descriptions can use stdin:
 
 ```bash
-workboard run <<'JSON'
+soulsteads-workboard run <<'JSON'
 {"op":"issue_create","project":"AG","kind":"bug","title":"Fix worker restart","description":"Describe reproduction and expected behavior","acceptance_criteria":["Restart preserves progress"],"priority":"high"}
 JSON
 ```

@@ -87,12 +87,12 @@ parent directory must already exist.
 Run these commands in a fresh database, with `WORKBOARD_API_KEY` unset:
 
 ```bash
-workboard run '{"op":"agent_register","id":"coordinator","name":"Coordinator"}'
-workboard run '{"op":"agent_register","id":"forge","name":"Forge","capabilities":["rust","tests"]}'
-workboard run '{"op":"project_create","key":"AG","name":"Agent platform"}'
-workboard run '{"op":"issue_create","project":"AG","kind":"epic","title":"Ship agent coordination"}'
-workboard run '{"op":"issue_create","project":"AG","kind":"story","title":"Implement the work loop","parent":"AG-1","acceptance_criteria":["Integration tests pass"]}'
-workboard run '{"op":"issue_transition","key":"AG-2","expected_revision":1,"state":"ready"}'
+soulsteads-workboard run '{"op":"agent_register","id":"coordinator","name":"Coordinator"}'
+soulsteads-workboard run '{"op":"agent_register","id":"forge","name":"Forge","capabilities":["rust","tests"]}'
+soulsteads-workboard run '{"op":"project_create","key":"AG","name":"Agent platform"}'
+soulsteads-workboard run '{"op":"issue_create","project":"AG","kind":"epic","title":"Ship agent coordination"}'
+soulsteads-workboard run '{"op":"issue_create","project":"AG","kind":"story","title":"Implement the work loop","parent":"AG-1","acceptance_criteria":["Integration tests pass"]}'
+soulsteads-workboard run '{"op":"issue_transition","key":"AG-2","expected_revision":1,"state":"ready"}'
 ```
 
 Identities and project keys are stable: duplicate registrations and creations
@@ -102,8 +102,8 @@ and `board` instead.
 ### 3. Issue a key and open the dashboard
 
 ```bash
-workboard run '{"op":"api_key_create","agent":"forge","label":"Forge workstation"}'
-workboard web
+soulsteads-workboard run '{"op":"api_key_create","agent":"forge","label":"Forge workstation"}'
+soulsteads-workboard web
 ```
 
 Save the returned `api_key` privately; the secret is shown only once. Open
@@ -125,10 +125,10 @@ Local workers use the same absolute database path as the server:
 ```bash
 export WORKBOARD_DB="/absolute/path/to/workboard.sqlite3"
 export WORKBOARD_API_KEY="your-issued-key"
-workboard run '{"op":"issue_claim","project":"AG","lease_seconds":900}'
+soulsteads-workboard run '{"op":"issue_claim","project":"AG","lease_seconds":900}'
 ```
 
-`workboard run` also accepts JSON from stdin or `-`. `workboard schema` prints the
+`soulsteads-workboard run` also accepts JSON from stdin or `-`. `soulsteads-workboard schema` prints the
 complete command schema without opening a database. Unknown fields are rejected.
 CLI flags override environment settings; the default database is
 `workboard.sqlite3` in the current directory and the default unkeyed actor is
@@ -143,7 +143,7 @@ same database. Replace the paths and key in your MCP client configuration:
 {
   "mcpServers": {
     "agent-workboard": {
-      "command": "/absolute/path/to/workboard",
+      "command": "/absolute/path/to/soulsteads-workboard",
       "args": ["--db", "/absolute/path/to/workboard.sqlite3", "mcp"],
       "env": {"WORKBOARD_API_KEY": "your-issued-key"}
     }
@@ -229,7 +229,7 @@ transition map, filters, pagination, sprint rules, and error codes.
 Give it a `query`, or the name of a `saved` search:
 
 ```bash
-workboard run '{"op":"issue_search","query":"lease timeout state:ready -flaky"}'
+soulsteads-workboard run '{"op":"issue_search","query":"lease timeout state:ready -flaky"}'
 ```
 
 | Query | Meaning |
@@ -256,8 +256,8 @@ search engine as syntax, so punctuation cannot cause errors.
 Save a search for every agent to reuse. Only its owner can replace or delete it:
 
 ```bash
-workboard run '{"op":"filter_save","name":"ready-bugs","query":"kind:bug state:ready is:actionable"}'
-workboard run '{"op":"issue_search","saved":"ready-bugs"}'
+soulsteads-workboard run '{"op":"filter_save","name":"ready-bugs","query":"kind:bug state:ready is:actionable"}'
+soulsteads-workboard run '{"op":"issue_search","saved":"ready-bugs"}'
 ```
 
 `filter_list` shows them, and `filter_delete` removes one. The query is validated
@@ -271,7 +271,7 @@ every repeat with the original result.
 
 | Interface | How to supply the key |
 | --- | --- |
-| CLI | `workboard run '{...}' --idempotency-key KEY` |
+| CLI | `soulsteads-workboard run '{...}' --idempotency-key KEY` |
 | HTTP | `Idempotency-Key: KEY` request header |
 | MCP | an `idempotency_key` argument beside the command fields |
 
@@ -306,12 +306,12 @@ curl -N "$WORKBOARD_URL/api/events/stream?project=AG" \
 key-authenticated sessions cannot manage them.
 
 ```bash
-workboard run '{"op":"webhook_create","url":"https://ci.example.com/hook","label":"CI","project":"AG","actions":["issue_transitioned"]}'
+soulsteads-workboard run '{"op":"webhook_create","url":"https://ci.example.com/hook","label":"CI","project":"AG","actions":["issue_transitioned"]}'
 ```
 
 The result includes a `whsec_…` signing secret that is shown once. `project` and
 `actions` are optional filters; omit them to receive everything. Only events after
-creation are sent. Webhooks are delivered by `workboard web`, which must be running.
+creation are sent. Webhooks are delivered by `soulsteads-workboard web`, which must be running.
 
 Each delivery is a `POST` with the event as JSON and these headers:
 
@@ -360,7 +360,7 @@ restores unrevoked keys. Key-authenticated sessions cannot administer keys.
 
 ## Running and operating the board
 
-- **Local by default:** `workboard web` binds to `127.0.0.1:7878`. Use `--listen`
+- **Local by default:** `soulsteads-workboard web` binds to `127.0.0.1:7878`. Use `--listen`
   to change the address or port. Put remote access behind an HTTPS reverse proxy.
 - **A trusted agent pool:** keys identify agents, not project-specific roles.
   Agents can coordinate assignments across the board. Unkeyed CLI/MCP access is
@@ -391,8 +391,8 @@ cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --locked --release
-uv run --locked scripts/validate_mcp.py target/release/workboard
-uv run --locked scripts/validate_web.py target/release/workboard --install-browser
+uv run --locked scripts/validate_mcp.py target/release/soulsteads-workboard
+uv run --locked scripts/validate_web.py target/release/soulsteads-workboard --install-browser
 ```
 
 The suite covers concurrent claims, stale revisions, lease recovery, rollback,

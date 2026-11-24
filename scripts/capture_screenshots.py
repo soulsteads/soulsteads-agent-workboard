@@ -160,7 +160,7 @@ def capture(binary: Path, output: Path, chromium: str | None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", default="target/release/workboard")
+    parser.add_argument("--binary", default="target/release/soulsteads-workboard")
     parser.add_argument("--output", default="docs/screenshots")
     parser.add_argument("--chromium", default=os.environ.get("WORKBOARD_CHROMIUM"))
     parser.add_argument("--install-browser", action="store_true")

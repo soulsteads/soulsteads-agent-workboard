@@ -4,7 +4,7 @@
 # ///
 """Browser integration test of the installed web dashboard and authenticated API.
 
-uv run --locked scripts/validate_web.py target/debug/workboard
+uv run --locked scripts/validate_web.py target/debug/soulsteads-workboard
 Use --install-browser to install the Chromium version in the locked test environment
 (or set WORKBOARD_CHROMIUM to an existing Chromium executable).
 All agents, API keys and work are disposable fixtures in a temporary database.
@@ -190,7 +190,7 @@ def validate(binary, screenshots, chromium):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("binary", nargs="?", default="target/debug/workboard")
+    parser.add_argument("binary", nargs="?", default="target/debug/soulsteads-workboard")
     parser.add_argument("--install-browser", action="store_true", help="Install matching Chromium before validation")
     parser.add_argument("--with-deps", action="store_true", help="Install Chromium system dependencies too (Linux/CI)")
     parser.add_argument("--screenshots", help="Optional directory for desktop/mobile QA screenshots")

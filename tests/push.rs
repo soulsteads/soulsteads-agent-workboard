@@ -307,7 +307,7 @@ fn cli_and_mcp_accept_idempotency_keys() {
     let create =
         json!({"op":"issue_create","project":"PUSH","kind":"task","title":"cli"}).to_string();
     let call = || {
-        let out = Process::new(env!("CARGO_BIN_EXE_workboard"))
+        let out = Process::new(env!("CARGO_BIN_EXE_soulsteads-workboard"))
             .arg("--db")
             .arg(&db)
             .args([
