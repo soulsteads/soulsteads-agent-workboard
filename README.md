@@ -403,6 +403,23 @@ See [validation coverage](docs/validation.md) and the [screenshot capture
 guide](docs/screenshots/README.md). A GitHub Actions workflow includes the build,
 lint, test, SDK, and browser checks.
 
+## Debian package
+
+Build an amd64 `.deb` from a Git checkout on Debian 13 or Ubuntu 24.04. Install
+`build-essential`, `binutils`, `pkg-config`, `cmake`, `libssl-dev`, `dpkg`,
+`python3` (3.11 or newer), and Rust 1.100.0 via `rustup`.
+
+```sh
+scripts/build-deb.sh dist/debian
+```
+
+The package installs `soulsteads-workboard` under `/usr/bin` and preserves the release
+license and dependency notices. Install it with `sudo apt install ./dist/debian/*.deb`
+from the checkout. Installation does not create or start a service. A build
+reflects the build host’s library ABI; use one of the stated distributions for
+portable artifacts. The release workflow also builds a downloadable test `.deb`
+on pull requests or manual runs, without attaching it to a GitHub Release.
+
 ## License
 
 [Apache-2.0](LICENSE).
