@@ -974,53 +974,78 @@ async fn dispatcher_regression_pause_stops_batch_and_resume_preserves_remaining_
     );
 }
 
-#[tokio::test]
-async fn dispatcher_regression_wakes_keep_one_batch_in_flight_and_drain_promptly() {
+#[tokio::test(start_paused = true)]
+async fn dispatcher_regression_wakes_keep_one_batch_in_flight_and_drain_without_polling() {
     let board = Board::new();
     let db = Arc::new(Mutex::new(board.open()));
     let hub = Hub::new();
     let mut receiver = GatedReceiver::new().await;
     let id = gated_subscription(&db, &receiver);
     let mut events = queued_issues(&db, 1);
+
+    // Keep Tokio from auto-advancing to the dispatcher's idle poll while the
+    // real HTTP/SQLite work runs. This blocking watchdog bounds a hung test in
+    // wall time; the virtual clock is not a throughput budget for the queue.
+    let (finished, stop) = std::sync::mpsc::channel::<()>();
+    let mut watchdog = tokio::task::spawn_blocking(move || {
+        let _ = stop.recv_timeout(Duration::from_secs(10));
+    });
+    let started = tokio::time::Instant::now();
     let worker = tokio::spawn(webhooks::run(db.clone(), hub.subscribe()));
-    let first = receiver.next().await;
-    events.extend(queued_issues(&db, 30));
-    for _ in 0..10 {
-        hub.notify();
-        tokio::task::yield_now().await;
-    }
-    let overlapping =
-        tokio::time::timeout(Duration::from_millis(200), receiver.requests.recv()).await;
-    receiver.permits.add_permits(events.len());
-    let remaining = tokio::time::timeout(Duration::from_millis(700), async {
-        let mut received = Vec::new();
-        for _ in 1..events.len() {
-            received.push(
-                receiver.requests.recv().await.unwrap()["id"]
-                    .as_i64()
-                    .unwrap(),
-            );
+    let deliveries = async {
+        let first = receiver.requests.recv().await?;
+        events.extend(queued_issues(&db, 30));
+        for _ in 0..10 {
+            hub.notify();
+            tokio::task::yield_now().await;
         }
-        received
-    })
-    .await;
-    let all_acked = cursor_reaches(&board, &id, *events.last().unwrap()).await;
+        // Keep the first response gated during the existing overlap check.
+        let overlap_window = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let overlapping = tokio::select! {
+            biased;
+            request = receiver.requests.recv() => Some(request?),
+            _ = overlap_window => None,
+        };
+        if overlapping.is_some() {
+            return Some((first, overlapping, Vec::new()));
+        }
+        receiver.permits.add_permits(events.len());
+        let mut remaining = Vec::new();
+        for _ in 1..events.len() {
+            remaining.push(receiver.requests.recv().await?["id"].as_i64().unwrap());
+        }
+        Some((first, overlapping, remaining))
+    };
+    let (received, timed_out) = tokio::select! {
+        biased;
+        _ = &mut watchdog => (None, true),
+        received = deliveries => (received, false),
+    };
+    let clock_stayed_paused = tokio::time::Instant::now() == started;
+    drop(finished);
+    if !timed_out {
+        watchdog.await.unwrap();
+    }
+    tokio::time::resume();
+    let all_acked = matches!(received, Some((_, None, _)))
+        && cursor_reaches(&board, &id, *events.last().unwrap()).await;
     worker.abort();
     let _ = worker.await;
     receiver.stop().await;
-    assert_eq!(
-        first.map(|event| event["id"].clone()),
-        Some(json!(events[0]))
-    );
     assert!(
-        overlapping.is_err(),
+        clock_stayed_paused,
+        "the idle poll must not run during delivery"
+    );
+    let (first, overlapping, remaining) =
+        received.expect("queued deliveries stalled without the idle poll");
+    assert_eq!(first["id"], json!(events[0]));
+    assert!(
+        overlapping.is_none(),
         "wakes must not start overlapping batches"
     );
-    assert_eq!(
-        remaining.ok(),
-        Some(events[1..].to_vec()),
-        "pending batches must drain without waiting for the one-second idle poll"
-    );
+    assert_eq!(remaining, events[1..]);
     assert!(all_acked);
 }
 
